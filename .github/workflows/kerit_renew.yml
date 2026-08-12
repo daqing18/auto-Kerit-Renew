@@ -1,18 +1,23 @@
 name: Kerit-Renew
+
 on:
   workflow_dispatch:
   schedule:
     - cron: '12 2 */3 * *'
+
 jobs:
   run_kerit_login:
     runs-on: ubuntu-latest
+
     steps:
-      - name: 📥 下载公库代码
+      - name: 📥 下载代码
         uses: actions/checkout@v4
+
       - name: 🐍 设置 Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
+
       - name: 📡 安装 Hysteria2
         run: |
           if [ -n "${{ secrets.HY2_PROXY_URL }}" ]; then
@@ -26,25 +31,29 @@ jobs:
           else
             echo "⚠️ 未配置代理，跳过 Hysteria2 安装"
           fi
+
       - name: 🛠️ 安装系统依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             google-chrome-stable \
             xvfb \
-            x11-utils \
-            xdotool \
-            scrot
+            fonts-noto-cjk
+          # 注意：新脚本使用 seleniumbase uc_gui_click_captcha() 过 Turnstile，
+          # 不再需要 xdotool / x11-utils / scrot 等点击截屏工具
+
       - name: 🐍 安装 Python 依赖
         run: |
           pip install seleniumbase
           seleniumbase install uc_driver
-      - name: ⏳ 添加随机延迟
+
+      - name: ⏳ 添加随机延迟（避免定时触发时间过于固定）
         run: |
           delay=$((RANDOM % 120))
           echo "随机延迟: ${delay}秒"
           sleep $delay
-      - name: 🚀 运行脚本
+
+      - name: 🚀 运行续期脚本
         env:
           PYTHONIOENCODING: utf-8
           KERIT_ACCOUNT: ${{ secrets.KERIT_ACCOUNT }}
@@ -53,12 +62,14 @@ jobs:
           TG_BOT: ${{ secrets.TG_BOT }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python kerit_renew.py
-      - name: 📸 上传截图
+
+      - name: 📸 上传截图（失败时调试用）
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
           path: "*.png"
+
       - name: ⏱️ 提交执行时间
         if: always()
         run: |
@@ -75,3 +86,12 @@ jobs:
             git push -f origin HEAD:main
             echo "✅ 更改已推送"
           fi
+
+      - name: 🧹 清理进程和临时文件
+        if: always()
+        run: |
+          pkill -f hysteria || true
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f /tmp/hy2.json
