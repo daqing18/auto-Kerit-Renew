@@ -397,10 +397,40 @@ def do_renew(sb, ip_info=None, email=None):
         "(function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()"
     )
     if not server_id:
-        print("❌ serverData.id 缺失")
-        sb.save_screenshot("no_server_id.png")
-        send_tg("❌ serverData.id 缺失，续期失败", ip_info=ip_info, email=email)
-        return
+        # serverData 可能是异步加载的，等待一下
+        print("⏳ serverData.id 缺失，等待异步加载...")
+        for i in range(10):
+            time.sleep(2)
+            server_id = sb.execute_script(
+                "(function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()"
+            )
+            if server_id:
+                print(f"✅ 异步加载完成，服务器ID: {server_id}")
+                break
+        if not server_id:
+            # 诊断：打印页面上所有可能的数据结构
+            diag = sb.execute_script("""
+                (function(){
+                    var result = {};
+                    if (typeof serverData !== 'undefined') {
+                        result.serverData = JSON.stringify(serverData).substring(0, 500);
+                    }
+                    result.globals = Object.keys(window).filter(k =>
+                        ['data','server','panel','user','config','state'].some(s =>
+                            k.toLowerCase().includes(s)
+                        )
+                    ).slice(0, 20);
+                    result.title = document.title;
+                    result.text = document.body ? document.body.innerText.substring(0, 800) : '';
+                    var s = document.querySelector('#__NEXT_DATA__');
+                    if (s) result.next_data = JSON.stringify(s.textContent).substring(0, 500);
+                    return JSON.stringify(result);
+                })()
+            """)
+            print(f"🔍 页面诊断: {diag}")
+            sb.save_screenshot("no_server_id.png")
+            send_tg("❌ serverData.id 缺失，续期失败", ip_info=ip_info, email=email)
+            return
     print(f"🆔 服务器ID: {server_id}")
 
     initial_count = sb.execute_script("""
