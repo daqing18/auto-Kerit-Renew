@@ -794,18 +794,34 @@ def run_script():
 
             print("🚀 点击验证...")
             verify_clicked = False
+            
+            # 新增：给前端框架一点时间反应，激活验证按钮
+            time.sleep(1.5)
+
             for sel in [
                 '//button[contains(., "Verify Code")]',
                 '//span[contains(., "Verify Code")]',
+                '//button[contains(., "Verify")]',  # 扩大匹配范围
                 'button[type="submit"]',
             ]:
                 try:
                     if sb.is_element_visible(sel):
                         sb.click(sel)
                         verify_clicked = True
+                        print(f"✅ 常规点击[验证]成功 ({sel})")
                         break
                 except Exception:
                     continue
+
+            # ================= 新增：JS 强制点击兜底 =================
+            if not verify_clicked:
+                try:
+                    sb.execute_script("document.querySelector('button[type=\"submit\"]').click();")
+                    verify_clicked = True
+                    print("✅ JS 强制点击[验证]成功")
+                except Exception:
+                    pass
+            # =========================================================
 
             if not verify_clicked:
                 print("❌ 验证按钮缺失")
