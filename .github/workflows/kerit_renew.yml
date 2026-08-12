@@ -51,6 +51,8 @@ jobs:
           PYTHONIOENCODING: utf-8
           KERIT_ACCOUNT: ${{ secrets.KERIT_ACCOUNT }}
           TG_BOT: ${{ secrets.TG_BOT }}
+          KERIT_COOKIE_CF_CLEARANCE: ${{ secrets.KERIT_COOKIE_CF_CLEARANCE }}
+          KERIT_COOKIE_SESSION_ID: ${{ secrets.KERIT_COOKIE_SESSION_ID }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python kerit_renew.py
 
