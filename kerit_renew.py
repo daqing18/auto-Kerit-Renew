@@ -644,15 +644,43 @@ def run_script():
                 send_tg("❌ 继续按钮缺失", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
+            # 等待页面切换（从邮箱输入页到 OTP 页），最多等 60 秒
             print("📨 等待 OTP 框...")
-            try:
-                sb.wait_for_element_visible('.otp-input', timeout=30)
-            except Exception:
+            otp_loaded = False
+            otp_selectors = ['.otp-input', 'input[autocomplete="one-time-code"]', 'input[type="tel"]', 'input[data-testid*="otp"]', 'input[class*="otp"]', 'input[class*="code"]']
+            for _ in range(60):
+                try:
+                    for sel in otp_selectors:
+                        if sb.is_element_visible(sel):
+                            otp_loaded = True
+                            break
+                    if otp_loaded:
+                        break
+                except Exception:
+                    pass
+                # 检查当前页面是否还在邮箱输入页
+                try:
+                    if sb.is_element_visible('#email-input'):
+                        if _ % 10 == 0:
+                            print(f"⏳ 仍在邮箱页，等待 OTP 页面加载... ({_ + 1}s)")
+                except Exception:
+                    pass
+                time.sleep(1)
+
+            if not otp_loaded:
                 print("❌ OTP 框加载失败")
                 sb.save_screenshot("kerit_no_otp.png")
-                send_tg("❌ OTP 框加载失败", ip_info=ip_info, email=MASKED_EMAIL)
+                try:
+                    with open("kerit_otp_page.html", "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                    print("📄 已保存页面源码: kerit_otp_page.html")
+                except Exception:
+                    pass
+                send_tg("❌ OTP 框加载失败（页面结构变化或按钮未生效）", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
+            # 先等 OTP 稳定了再取邮件，给 Gmail 多几秒
+            time.sleep(2)
             try:
                 code = fetch_otp_from_gmail(wait_seconds=60)
             except TimeoutError as e:
@@ -661,26 +689,78 @@ def run_script():
                 send_tg("❌ Gmail OTP 获取超时", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
-            otp_inputs = sb.find_elements('.otp-input')
+            # 查找 OTP 输入框（多个选择器兜底）
+            otp_selector = '.otp-input'
+            otp_inputs = sb.find_elements(otp_selector)
             if len(otp_inputs) < 4:
+                for sel in ['input[autocomplete="one-time-code"]', 'input[type="tel"]', 'input[data-testid*="otp"]', 'input[class*="otp"]', 'input[class*="code"]']:
+                    otp_inputs = sb.find_elements(sel)
+                    if len(otp_inputs) >= 4:
+                        otp_selector = sel
+                        break
+            if len(otp_inputs) < 4:
+                # 兜底：用 JS 找所有 visible input
+                try:
+                    js_otp = sb.execute_script("""
+                        (function(){
+                            var inputs = document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="email"]):not([type="password"])');
+                            var visible = [];
+                            for (var i = 0; i < inputs.length; i++) {
+                                if (inputs[i].offsetParent !== null && inputs[i].offsetWidth > 0) {
+                                    visible.push(inputs[i]);
+                                }
+                            }
+                            return visible.length;
+                        })()
+                    """)
+                    print(f"📊 JS 查询可见 input 数量: {js_otp}")
+                    if js_otp >= 4:
+                        otp_selector = 'JS_FALLBACK'
+                except Exception:
+                    pass
+
+            if len(otp_inputs) < 4 and otp_selector != 'JS_FALLBACK':
                 print(f"❌ OTP 框不足: {len(otp_inputs)}")
                 send_tg(f"❌ OTP 框数量不足（{len(otp_inputs)}）", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
-            print(f"⌨️ 填入 OTP: {code}")
+            print(f"⌨️ 填入 OTP: {code} (选择器: {otp_selector})")
             for i, char in enumerate(code):
-                js = f"""
-                    (function() {{
-                        var inputs = document.querySelectorAll('.otp-input');
-                        var inp = inputs[{i}];
-                        if (!inp) return;
-                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value').set;
-                        nativeInputValueSetter.call(inp, '{char}');
-                        inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }})();
-                """
+                if otp_selector == 'JS_FALLBACK':
+                    # 用 JS 找到第 i 个可见 input
+                    js = f"""
+                        (function() {{
+                            var inputs = document.querySelectorAll('input:not([type="hidden"]):not([type="email"]):not([type="password"])');
+                            var visible = [];
+                            for (var j = 0; j < inputs.length; j++) {{
+                                if (inputs[j].offsetParent !== null && inputs[j].offsetWidth > 0) {{
+                                    visible.push(inputs[j]);
+                                }}
+                            }}
+                            var inp = visible[{i}];
+                            if (!inp) return;
+                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            nativeInputValueSetter.call(inp, '{char}');
+                            inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            inp.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
+                        }})();
+                    """
+                else:
+                    js = f"""
+                        (function() {{
+                            var inputs = document.querySelectorAll('{otp_selector}');
+                            var inp = inputs[{i}];
+                            if (!inp) return;
+                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            nativeInputValueSetter.call(inp, '{char}');
+                            inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            inp.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
+                        }})();
+                    """
                 sb.execute_script(js)
                 time.sleep(0.1)
 
