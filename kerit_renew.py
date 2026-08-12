@@ -22,7 +22,6 @@ def mask_email(email_str: str) -> str:
     parts = email_str.split("@")
     local = parts[0]
     domain = parts[1]
-    
     if len(local) > 2:
         return local[0] + "*" * (len(local) - 2) + local[-1] + "@" + domain
     else:
@@ -160,14 +159,14 @@ def start_proxy_with_retry(max_retries=3):
     if not HY2_PROXY_URL:
         print("⚠️ 未配置代理 URL，使用直连模式")
         return None, None
-    
+
     proxy_manager = get_proxy_manager()
     proxy_url = None
-    
+
     if not proxy_manager:
         print("⚠️ 代理管理器初始化失败，使用直连模式")
         return None, None
-    
+
     for attempt in range(1, max_retries + 1):
         print(f"🔄 尝试启动代理 ({attempt}/{max_retries})...")
         if proxy_manager.start():
@@ -180,7 +179,7 @@ def start_proxy_with_retry(max_retries=3):
                 time.sleep(5)
             else:
                 print("⚠️ 代理启动失败，继续使用直连模式")
-    
+
     return None, None
 
 
@@ -198,7 +197,6 @@ def send_tg(result, server_id=None, remaining=None, ip_info=None, email=None):
         f"🕐 运行时间: {now_str()}",
     ]
     if email:
-        # 如果 TG_CHAT_ID 为空，则使用 id=0000，否则使用实际的 chat_id
         tg_user_id = TG_CHAT_ID if TG_CHAT_ID else "0000"
         tg_user_link = f'<a href="tg://user?id={tg_user_id}">{email}</a>'
         lines.append(f"📮 邮箱: {tg_user_link}")
@@ -327,7 +325,7 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
 
 
 # ============================================================
-# Turnstile 工具函数
+# Turnstile 工具函数（采用 seleniumbase 内置解法，替代 xdotool）
 # ============================================================
 
 EXPAND_POPUP_JS = """
@@ -357,112 +355,16 @@ EXPAND_POPUP_JS = """
 })();
 """
 
-def xdotool_click(x, y):
-    x, y = int(x), int(y)
-    try:
-        result = subprocess.run(
-            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
-            capture_output=True, text=True, timeout=3
-        )
-        wids = [w for w in result.stdout.strip().split('\n') if w]
-        if wids:
-            subprocess.run(["xdotool", "windowactivate", wids[-1]],
-                           timeout=2, stderr=subprocess.DEVNULL)
-            time.sleep(0.2)
-        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, check=True)
-        time.sleep(0.15)
-        subprocess.run(["xdotool", "click", "1"], timeout=2, check=True)
-        print(f"📐 坐标点击成功")
-        return True
-    except Exception as e:
-        print(f"⚠️ xdotool点击失败：{e}")
-        return False
-
-
-def get_turnstile_coords(sb):
-    try:
-        return sb.execute_script("""
-            (function(){
-                var iframes = document.querySelectorAll('iframe');
-                for (var i = 0; i < iframes.length; i++) {
-                    var src = iframes[i].src || '';
-                    if (src.includes('cloudflare') || src.includes('turnstile')) {
-                        var rect = iframes[i].getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0) {
-                            return {
-                                click_x: Math.round(rect.x + 30),
-                                click_y: Math.round(rect.y + rect.height / 2)
-                            };
-                        }
-                    }
-                }
-                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                if (input) {
-                    var container = input.parentElement;
-                    for (var j = 0; j < 5; j++) {
-                        if (!container) break;
-                        var rect = container.getBoundingClientRect();
-                        if (rect.width > 100 && rect.height > 30) {
-                            return {
-                                click_x: Math.round(rect.x + 30),
-                                click_y: Math.round(rect.y + rect.height / 2)
-                            };
-                        }
-                        container = container.parentElement;
-                    }
-                }
-                return null;
-            })()
-        """)
-    except Exception:
-        return None
-
-
-def get_window_offset(sb):
-    try:
-        result = subprocess.run(
-            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
-            capture_output=True, text=True, timeout=3
-        )
-        wids = [w for w in result.stdout.strip().split('\n') if w]
-        if wids:
-            geo = subprocess.run(
-                ["xdotool", "getwindowgeometry", "--shell", wids[-1]],
-                capture_output=True, text=True, timeout=3
-            ).stdout
-            geo_dict = {}
-            for line in geo.strip().split('\n'):
-                if '=' in line:
-                    k, v = line.split('=', 1)
-                    geo_dict[k.strip()] = int(v.strip())
-            win_x = geo_dict.get('X', 0)
-            win_y = geo_dict.get('Y', 0)
-            info = sb.execute_script(
-                "(function(){ return { outer: window.outerHeight, inner: window.innerHeight }; })()"
-            )
-            toolbar = info['outer'] - info['inner']
-            if not (30 <= toolbar <= 200):
-                toolbar = 87
-            return win_x, win_y, toolbar
-    except Exception:
-        pass
-    try:
-        info = sb.execute_script("""
-            (function(){
-                return {
-                    screenX: window.screenX || 0,
-                    screenY: window.screenY || 0,
-                    outer: window.outerHeight,
-                    inner: window.innerHeight
-                };
-            })()
-        """)
-        toolbar = info['outer'] - info['inner']
-        if not (30 <= toolbar <= 200):
-            toolbar = 87
-        return info['screenX'], info['screenY'], toolbar
-    except Exception:
-        return 0, 0, 87
+# CF 挑战页特征关键词（用于判断挑战是否已通过）
+CF_INDICATORS = [
+    "verify you are human",
+    "确认您是真人",
+    "just a moment...",
+    "checking your browser",
+    "troubleshoot",
+    "cf-chl",
+    "challenges.cloudflare.com",
+]
 
 
 def check_token(sb) -> bool:
@@ -501,33 +403,58 @@ def turnstile_exists(sb) -> bool:
         return False
 
 
+def wait_for_turnstile_pass(sb, timeout=30) -> bool:
+    """等待 Turnstile/CF 挑战通过（eooce 风格：检测页面特征）"""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            # 1) 优先看 token 是否已填充
+            if check_token(sb):
+                print("✅ Turnstile 验证已通过（token 已填充）")
+                return True
+            # 2) 检测页面是否已离开 CF 挑战特征
+            page_lower = sb.get_page_source().lower()
+            if not any(k in page_lower for k in CF_INDICATORS):
+                print("✅ Turnstile 验证已通过（页面已离开挑战页）")
+                return True
+        except Exception:
+            pass
+        sb.sleep(1)
+    print("❌ Turnstile 验证超时未通过")
+    return False
+
+
 def solve_turnstile(sb) -> bool:
-    for _ in range(3):
+    """使用 seleniumbase 内置 uc_gui_click_captcha() 点击 Turnstile，替代 xdotool"""
+    # 先尝试直接把 iframe 撑开，便于点击
+    try:
         sb.execute_script(EXPAND_POPUP_JS)
         time.sleep(0.5)
+    except Exception:
+        pass
 
+    # 若 token 已填充，直接通过
     if check_token(sb):
-        print("✅ Token已存在")
+        print("✅ Token 已存在")
         return True
 
-    coords = get_turnstile_coords(sb)
-    if not coords:
-        print("❌ 无法获取坐标")
-        return False
+    for attempt in range(1, 4):
+        print(f"🖱️ 尝试点击 Turnstile ({attempt}/3)...")
+        try:
+            # seleniumbase 内置 UC 模式点击验证码（自动找 challenges.cloudflare.com iframe）
+            sb.uc_gui_click_captcha()
+            time.sleep(12)  # 等待 JS 验证执行
+        except Exception as e:
+            print(f"⚠️ uc_gui_click_captcha 出错: {e}")
+            time.sleep(2)
 
-    win_x, win_y, toolbar = get_window_offset(sb)
-    abs_x = coords['click_x'] + win_x
-    abs_y = coords['click_y'] + win_y + toolbar
-    print(f"🖱️ 点击Token: ({abs_x}, {abs_y})")
-    xdotool_click(abs_x, abs_y)
-
-    for _ in range(30):
-        time.sleep(0.5)
-        if check_token(sb):
-            print("✅ Cloudflare Token通过")
+        if wait_for_turnstile_pass(sb, timeout=20):
+            print("✅ Cloudflare Token 通过")
             return True
+        else:
+            print(f"⏳ 第 {attempt} 次未通过，重试点击...")
 
-    print("❌ Cloudflare Token超时")
+    print("❌ Cloudflare Token 超时")
     sb.save_screenshot("turnstile_fail.png")
     return False
 
@@ -551,7 +478,7 @@ def extract_remaining_days(sb) -> int:
 
 def do_renew(sb, ip_info=None, email=None):
     print("🔄 跳转续期页...")
-    sb.open(FREE_PANEL_URL)
+    sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=4)
     time.sleep(4)
     sb.save_screenshot("free_panel.png")
 
@@ -711,7 +638,7 @@ def run_script():
     # 初始化代理
     proxy_manager, proxy_url = start_proxy_with_retry(max_retries=3)
     ip_info = ""
-    
+
     # 检查 IP 信息
     print(f"🔍 正在检查 IP 信息（使用代理: {bool(proxy_url)})...")
     ip_info = check_ip(proxy_url)
@@ -740,7 +667,7 @@ def run_script():
             for _ in range(20):
                 time.sleep(0.5)
                 if turnstile_exists(sb):
-                    print("�️ 检测到Turnstile...")
+                    print("🛡️ 检测到Turnstile...")
                     if not solve_turnstile(sb):
                         sb.save_screenshot("kerit_cf_fail.png")
                         send_tg("❌ 登录页Turnstile验证失败", ip_info=ip_info, email=MASKED_EMAIL)
