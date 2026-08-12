@@ -389,8 +389,35 @@ def extract_remaining_days(sb) -> int:
 
 def do_renew(sb, ip_info=None, email=None):
     print("🔄 跳转续期页...")
-    sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=4)
-    time.sleep(4)
+
+    # 多次尝试打开续期页，处理 Cloudflare 挑战
+    page_loaded = False
+    for attempt in range(5):
+        try:
+            sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=4)
+        except Exception:
+            time.sleep(3)
+            continue
+        time.sleep(4)
+
+        title = sb.get_title() or ""
+        page_lower = sb.get_page_source().lower()
+        is_cf_challenge = "just a moment" in title.lower() or "performing security verification" in page_lower
+
+        if not is_cf_challenge:
+            print("✅ 续期页已加载，CF 挑战已清除")
+            page_loaded = True
+            break
+        else:
+            print(f"⏳ 检测到 CF 挑战页，等待清除... (尝试 {attempt+1}/5)")
+            time.sleep(10)
+
+    if not page_loaded:
+        print("❌ CF 挑战未清除，续期失败")
+        sb.save_screenshot("free_panel_cf_stuck.png")
+        send_tg("❌ free_panel CF 挑战未通过，续期失败", ip_info=ip_info, email=email)
+        return
+
     sb.save_screenshot("free_panel.png")
 
     server_id = sb.execute_script(
