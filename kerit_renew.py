@@ -623,6 +623,21 @@ def run_script():
             sb.type('#email-input', KERIT_EMAIL)
             print(f"✅ 邮箱：{MASKED_EMAIL}")
 
+            # ================= 新增：等待并处理表单内的 Turnstile 验证 =================
+            print("🛡️ 等待登录页 Turnstile 验证...")
+            time.sleep(2)  # 稍微停顿，给 Turnstile iframe 渲染的时间
+            if turnstile_exists(sb):
+                solve_turnstile(sb)
+            else:
+                # 遇到网络较慢时延迟加载的兜底
+                time.sleep(3)
+                if turnstile_exists(sb):
+                    solve_turnstile(sb)
+            
+            # 再等2秒，确保 Success 状态和 DOM 事件彻底被 Kerit 页面捕获
+            time.sleep(2)
+            # ===========================================================================
+
             print("🖱️ 点击继续...")
             clicked = False
             for sel in [
@@ -637,6 +652,16 @@ def run_script():
                         break
                 except Exception:
                     continue
+            
+            # ================= 新增：JS 强制点击作为兜底 =================
+            if not clicked:
+                try:
+                    sb.execute_script("document.querySelector('button[type=\"submit\"]').click();")
+                    clicked = True
+                    print("✅ JS 强制点击[继续]成功")
+                except Exception:
+                    pass
+            # =============================================================
 
             if not clicked:
                 print("❌ 继续按钮缺失")
