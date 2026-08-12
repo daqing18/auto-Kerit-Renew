@@ -50,6 +50,11 @@ MASKED_EMAIL = mask_email(KERIT_EMAIL)
 LOGIN_URL      = "https://billing.kerit.cloud/"
 FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
 
+# ---- Cookie 登录（优先使用，跳过 CF 挑战和邮箱/OTP 流程） ----
+KERIT_COOKIE_CF_CLEARANCE = os.environ.get("KERIT_COOKIE_CF_CLEARANCE", "").strip()
+KERIT_COOKIE_SESSION_ID   = os.environ.get("KERIT_COOKIE_SESSION_ID", "").strip()
+USE_COOKIE_LOGIN = bool(KERIT_COOKIE_CF_CLEARANCE and KERIT_COOKIE_SESSION_ID)
+
 # ---- 代理配置（sing-box 模式，由 setup_proxy.sh 设置环境变量） ----
 IS_PROXY     = os.environ.get("IS_PROXY", "false").lower() == "true"
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "socks5://127.0.0.1:1080").strip()
@@ -576,273 +581,297 @@ def run_script():
             except Exception:
                 print("⚠️ IP验证超时，跳过")
 
-            # ── 登录 ──
-            print("🔑 打开登录页面...")
-            sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
-            time.sleep(3)
+                        # ── 登录（优先 Cookie 注入，失败则回退邮箱/OTP） ──
+            login_ok = False
 
-            # 说明：登录页可能遇到 Cloudflare JS 挑战（challenges.cloudflare.com）
-            # 但这不是 Turnstile widget（没有 cf-turnstile-response input），
-            # 所以这里不检查 Turnstile，而是直接等待邮箱框出现，让 UC 模式自动处理挑战。
-            print("📭 等待邮箱框（UC 模式自动过 CF 挑战）...")
-            email_loaded = False
-            for _ in range(30):  # 最多等 90 秒
+            # 方式1：Cookie 注入登录（跳过 CF 挑战 + 邮箱/OTP）
+            if USE_COOKIE_LOGIN:
+                print("🍪 尝试 Cookie 注入登录...")
                 try:
-                    if sb.is_element_visible('#email-input'):
-                        email_loaded = True
-                        break
-                except Exception:
-                    pass
-                # 若页面仍停留在 CF 挑战，打印诊断信息
-                try:
-                    page_lower = sb.get_page_source().lower()
-                    if "performing security" in page_lower or "just a moment" in page_lower or "verify you are human" in page_lower:
-                        # 尝试重新连接让 UC 模式再次处理
-                        if _ % 10 == 0:
-                            print(f"⏳ 检测到 CF 挑战页，等待 UC 模式处理... ({( _ + 1) * 3}s)")
-                            try:
-                                sb.uc_gui_click_captcha()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
+                    time.sleep(2)
+                    print("📝 注入 cookie: cf_clearance, session_id ...")
+                    sb.add_cookie({"name": "cf_clearance", "value": KERIT_COOKIE_CF_CLEARANCE,
+                                   "domain": ".kerit.cloud", "path": "/"})
+                    sb.add_cookie({"name": "session_id", "value": KERIT_COOKIE_SESSION_ID,
+                                   "domain": ".kerit.cloud", "path": "/"})
+                    print("🌐 直接跳转续期页...")
+                    sb.open(FREE_PANEL_URL)
+                    time.sleep(3)
+                    current_url = sb.get_current_url()
+                    print(f"📝 当前URL: {current_url}")
+                    if "free_panel" in current_url or "/session" in current_url:
+                        page_src = sb.get_page_source().lower()
+                        if "login" not in current_url and "otp" not in current_url and "email" not in current_url.lower():
+                            print("✅ Cookie 登录成功！")
+                            login_ok = True
+                        else:
+                            print("❌ Cookie 登录失败，页面仍在登录页")
+                    else:
+                        print(f"❌ Cookie 登录失败，跳转到了: {current_url}")
+                except Exception as e:
+                    print(f"❌ Cookie 注入失败: {e}")
+
+            # 方式2：邮箱/OTP 登录（Cookie 失败或禁用时回退）
+            if not login_ok:
+                if USE_COOKIE_LOGIN:
+                    print("🔄 Cookie 登录失败，回退到邮箱/OTP 登录...")
+                print("🔑 打开登录页面...")
+                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
                 time.sleep(3)
 
-            if not email_loaded:
-                print("❌ 邮箱框加载失败（可能 CF 挑战未通过）")
-                sb.save_screenshot("kerit_no_email_input.png")
-                try:
-                    with open("kerit_page_source.html", "w", encoding="utf-8") as f:
-                        f.write(sb.get_page_source())
-                    print("📄 已保存页面源码: kerit_page_source.html")
-                except Exception:
-                    pass
-                send_tg("❌ 邮箱框加载失败（CF 挑战或页面结构变化）", ip_info=ip_info, email=MASKED_EMAIL)
-                return
-
-            sb.type('#email-input', KERIT_EMAIL)
-            print(f"✅ 邮箱：{MASKED_EMAIL}")
-
-            # ================= 新增：等待并处理表单内的 Turnstile 验证 =================
-            print("🛡️ 等待登录页 Turnstile 验证...")
-            time.sleep(2)  # 稍微停顿，给 Turnstile iframe 渲染的时间
-            if turnstile_exists(sb):
-                solve_turnstile(sb)
-            else:
-                # 遇到网络较慢时延迟加载的兜底
-                time.sleep(3)
-                if turnstile_exists(sb):
-                    solve_turnstile(sb)
-            
-            # 再等2秒，确保 Success 状态和 DOM 事件彻底被 Kerit 页面捕获
-            time.sleep(2)
-            # ===========================================================================
-
-            print("🖱️ 点击继续...")
-            clicked = False
-            for sel in [
-                '//button[contains(., "Continue with Email")]',
-                '//span[contains(., "Continue with Email")]',
-                'button[type="submit"]',
-            ]:
-                try:
-                    if sb.is_element_visible(sel):
-                        sb.click(sel)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            
-            # ================= 新增：JS 强制点击作为兜底 =================
-            if not clicked:
-                try:
-                    sb.execute_script("document.querySelector('button[type=\"submit\"]').click();")
-                    clicked = True
-                    print("✅ JS 强制点击[继续]成功")
-                except Exception:
-                    pass
-            # =============================================================
-
-            if not clicked:
-                print("❌ 继续按钮缺失")
-                sb.save_screenshot("kerit_no_continue_btn.png")
-                send_tg("❌ 继续按钮缺失", ip_info=ip_info, email=MASKED_EMAIL)
-                return
-
-            # 等待页面切换（从邮箱输入页到 OTP 页），最多等 60 秒
-            print("📨 等待 OTP 框...")
-            otp_loaded = False
-            otp_selectors = ['.otp-input', 'input[autocomplete="one-time-code"]', 'input[type="tel"]', 'input[data-testid*="otp"]', 'input[class*="otp"]', 'input[class*="code"]']
-            for _ in range(60):
-                try:
-                    for sel in otp_selectors:
-                        if sb.is_element_visible(sel):
-                            otp_loaded = True
+                print("📭 等待邮箱框（UC 模式自动过 CF 挑战）...")
+                email_loaded = False
+                for _ in range(30):
+                    try:
+                        if sb.is_element_visible('#email-input'):
+                            email_loaded = True
                             break
-                    if otp_loaded:
-                        break
-                except Exception:
-                    pass
-                # 检查当前页面是否还在邮箱输入页
-                try:
-                    if sb.is_element_visible('#email-input'):
-                        if _ % 10 == 0:
-                            print(f"⏳ 仍在邮箱页，等待 OTP 页面加载... ({_ + 1}s)")
-                except Exception:
-                    pass
-                time.sleep(1)
+                    except Exception:
+                        pass
+                    try:
+                        page_lower = sb.get_page_source().lower()
+                        if "performing security" in page_lower or "just a moment" in page_lower or "verify you are human" in page_lower:
+                            if _ % 10 == 0:
+                                print(f"⏳ 检测到 CF 挑战页，等待 UC 模式处理... ({( _ + 1) * 3}s)")
+                                try:
+                                    sb.uc_gui_click_captcha()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    time.sleep(3)
 
-            if not otp_loaded:
-                print("❌ OTP 框加载失败")
-                sb.save_screenshot("kerit_no_otp.png")
-                try:
-                    with open("kerit_otp_page.html", "w", encoding="utf-8") as f:
-                        f.write(sb.get_page_source())
-                    print("📄 已保存页面源码: kerit_otp_page.html")
-                except Exception:
-                    pass
-                send_tg("❌ OTP 框加载失败（页面结构变化或按钮未生效）", ip_info=ip_info, email=MASKED_EMAIL)
-                return
+                if not email_loaded:
+                    print("❌ 邮箱框加载失败（可能 CF 挑战未通过）")
+                    sb.save_screenshot("kerit_no_email_input.png")
+                    try:
+                        with open("kerit_page_source.html", "w", encoding="utf-8") as f:
+                            f.write(sb.get_page_source())
+                        print("📄 已保存页面源码: kerit_page_source.html")
+                    except Exception:
+                        pass
+                    send_tg("❌ 邮箱框加载失败（CF 挑战或页面结构变化）", ip_info=ip_info, email=MASKED_EMAIL)
+                    return
 
-            # 先等 OTP 稳定了再取邮件，给 Gmail 多几秒
-            time.sleep(2)
-            try:
-                code = fetch_otp_from_gmail(wait_seconds=60)
-            except TimeoutError as e:
-                print(e)
-                sb.save_screenshot("kerit_otp_timeout.png")
-                send_tg("❌ Gmail OTP 获取超时", ip_info=ip_info, email=MASKED_EMAIL)
-                return
+                sb.type('#email-input', KERIT_EMAIL)
+                print(f"✅ 邮箱：{MASKED_EMAIL}")
 
-            # 查找 OTP 输入框（多个选择器兜底）
-            otp_selector = '.otp-input'
-            otp_inputs = sb.find_elements(otp_selector)
-            if len(otp_inputs) < 4:
-                for sel in ['input[autocomplete="one-time-code"]', 'input[type="tel"]', 'input[data-testid*="otp"]', 'input[class*="otp"]', 'input[class*="code"]']:
-                    otp_inputs = sb.find_elements(sel)
-                    if len(otp_inputs) >= 4:
-                        otp_selector = sel
-                        break
-            if len(otp_inputs) < 4:
-                # 兜底：用 JS 找所有 visible input
+                print("🛡️ 等待 Turnstile 验证通过...")
+                turnstile_ready = False
+                for _ in range(40):
+                    try:
+                        token_val = sb.execute_script("""
+                            (function(){
+                                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                                return input && input.value && input.value.length > 20 ? input.value : '';
+                            })()
+                        """)
+                        if token_val:
+                            print("✅ Turnstile token 已填充")
+                            turnstile_ready = True
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                if not turnstile_ready:
+                    print("⚠️ Turnstile token 未检测到，尝试点击 Turnstile 复选框...")
+                    try:
+                        sb.uc_gui_click_captcha()
+                        time.sleep(5)
+                        token_val = sb.execute_script("""
+                            (function(){
+                                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                                return input && input.value && input.value.length > 20 ? input.value : '';
+                            })()
+                        """)
+                        if token_val:
+                            print("✅ Turnstile token 已填充（点击后）")
+                            turnstile_ready = True
+                        else:
+                            print("⚠️ Turnstile 仍未通过，但继续尝试点击按钮...")
+                    except Exception as e:
+                        print(f"⚠️ uc_gui_click_captcha 失败: {e}，继续尝试...")
+
+                print("🖱️ 点击继续...")
+                clicked = False
+                for sel in [
+                    '//button[contains(., "Continue with Email")]',
+                    '//span[contains(., "Continue with Email")]',
+                    'button[type="submit"]',
+                ]:
+                    try:
+                        if sb.is_element_visible(sel):
+                            sb.click(sel)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    print("❌ 继续按钮缺失")
+                    sb.save_screenshot("kerit_no_continue_btn.png")
+                    send_tg("❌ 继续按钮缺失", ip_info=ip_info, email=MASKED_EMAIL)
+                    return
+
+                print("📨 等待 OTP 框...")
+                otp_loaded = False
+                otp_selectors = ['.otp-input', 'input[autocomplete="one-time-code"]', 'input[type="tel"]', 'input[data-testid*="otp"]', 'input[class*="otp"]', 'input[class*="code"]']
+                for _ in range(60):
+                    try:
+                        for sel in otp_selectors:
+                            if sb.is_element_visible(sel):
+                                otp_loaded = True
+                                break
+                        if otp_loaded:
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        if sb.is_element_visible('#email-input'):
+                            if _ % 10 == 0:
+                                print(f"⏳ 仍在邮箱页，等待 OTP 页面加载... ({_ + 1}s)")
+                    except Exception:
+                        pass
+                    time.sleep(1)
+
+                if not otp_loaded:
+                    print("❌ OTP 框加载失败")
+                    sb.save_screenshot("kerit_no_otp.png")
+                    try:
+                        with open("kerit_otp_page.html", "w", encoding="utf-8") as f:
+                            f.write(sb.get_page_source())
+                        print("📄 已保存页面源码: kerit_otp_page.html")
+                    except Exception:
+                        pass
+                    send_tg("❌ OTP 框加载失败（页面结构变化或按钮未生效）", ip_info=ip_info, email=MASKED_EMAIL)
+                    return
+
+                time.sleep(2)
                 try:
-                    js_otp = sb.execute_script("""
-                        (function(){
-                            var inputs = document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="email"]):not([type="password"])');
-                            var visible = [];
-                            for (var i = 0; i < inputs.length; i++) {
-                                if (inputs[i].offsetParent !== null && inputs[i].offsetWidth > 0) {
-                                    visible.push(inputs[i]);
+                    code = fetch_otp_from_gmail(wait_seconds=60)
+                except TimeoutError as e:
+                    print(e)
+                    sb.save_screenshot("kerit_otp_timeout.png")
+                    send_tg("❌ Gmail OTP 获取超时", ip_info=ip_info, email=MASKED_EMAIL)
+                    return
+
+                otp_selector = '.otp-input'
+                otp_inputs = sb.find_elements(otp_selector)
+                if len(otp_inputs) < 4:
+                    for sel in ['input[autocomplete="one-time-code"]', 'input[type="tel"]', 'input[data-testid*="otp"]', 'input[class*="otp"]', 'input[class*="code"]']:
+                        otp_inputs = sb.find_elements(sel)
+                        if len(otp_inputs) >= 4:
+                            otp_selector = sel
+                            break
+                if len(otp_inputs) < 4:
+                    try:
+                        js_otp = sb.execute_script("""
+                            (function(){
+                                var inputs = document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="email"]):not([type="password"])');
+                                var visible = [];
+                                for (var i = 0; i < inputs.length; i++) {
+                                    if (inputs[i].offsetParent !== null && inputs[i].offsetWidth > 0) {
+                                        visible.push(inputs[i]);
+                                    }
                                 }
-                            }
-                            return visible.length;
-                        })()
-                    """)
-                    print(f"📊 JS 查询可见 input 数量: {js_otp}")
-                    if js_otp >= 4:
-                        otp_selector = 'JS_FALLBACK'
-                except Exception:
-                    pass
+                                return visible.length;
+                            })()
+                        """)
+                        print(f"📊 JS 查询可见 input 数量: {js_otp}")
+                        if js_otp >= 4:
+                            otp_selector = 'JS_FALLBACK'
+                    except Exception:
+                        pass
 
-            if len(otp_inputs) < 4 and otp_selector != 'JS_FALLBACK':
-                print(f"❌ OTP 框不足: {len(otp_inputs)}")
-                send_tg(f"❌ OTP 框数量不足（{len(otp_inputs)}）", ip_info=ip_info, email=MASKED_EMAIL)
-                return
+                if len(otp_inputs) < 4 and otp_selector != 'JS_FALLBACK':
+                    print(f"❌ OTP 框不足: {len(otp_inputs)}")
+                    send_tg(f"❌ OTP 框数量不足（{len(otp_inputs)}）", ip_info=ip_info, email=MASKED_EMAIL)
+                    return
 
-            print(f"⌨️ 填入 OTP: {code} (选择器: {otp_selector})")
-            for i, char in enumerate(code):
-                if otp_selector == 'JS_FALLBACK':
-                    # 用 JS 找到第 i 个可见 input
-                    js = f"""
-                        (function() {{
-                            var inputs = document.querySelectorAll('input:not([type="hidden"]):not([type="email"]):not([type="password"])');
-                            var visible = [];
-                            for (var j = 0; j < inputs.length; j++) {{
-                                if (inputs[j].offsetParent !== null && inputs[j].offsetWidth > 0) {{
-                                    visible.push(inputs[j]);
+                print(f"⌨️ 填入 OTP: {code} (选择器: {otp_selector})")
+                for i, char in enumerate(code):
+                    if otp_selector == 'JS_FALLBACK':
+                        js = f"""
+                            (function() {{
+                                var inputs = document.querySelectorAll('input:not([type="hidden"]):not([type="email"]):not([type="password"])');
+                                var visible = [];
+                                for (var j = 0; j < inputs.length; j++) {{
+                                    if (inputs[j].offsetParent !== null && inputs[j].offsetWidth > 0) {{
+                                        visible.push(inputs[j]);
+                                    }}
                                 }}
-                            }}
-                            var inp = visible[{i}];
-                            if (!inp) return;
-                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                window.HTMLInputElement.prototype, 'value').set;
-                            nativeInputValueSetter.call(inp, '{char}');
-                            inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            inp.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
-                        }})();
-                    """
-                else:
-                    js = f"""
-                        (function() {{
-                            var inputs = document.querySelectorAll('{otp_selector}');
-                            var inp = inputs[{i}];
-                            if (!inp) return;
-                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                window.HTMLInputElement.prototype, 'value').set;
-                            nativeInputValueSetter.call(inp, '{char}');
-                            inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            inp.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
-                        }})();
-                    """
-                sb.execute_script(js)
-                time.sleep(0.1)
+                                var inp = visible[{i}];
+                                if (!inp) return;
+                                var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'value').set;
+                                nativeInputValueSetter.call(inp, '{char}');
+                                inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                inp.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
+                            }})();
+                        """
+                    else:
+                        js = f"""
+                            (function() {{
+                                var inputs = document.querySelectorAll('{otp_selector}');
+                                var inp = inputs[{i}];
+                                if (!inp) return;
+                                var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'value').set;
+                                nativeInputValueSetter.call(inp, '{char}');
+                                inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                inp.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
+                            }})();
+                        """
+                    sb.execute_script(js)
+                    time.sleep(0.1)
 
-            print("✅ OTP 已填入")
-            time.sleep(0.5)
-
-            print("🚀 点击验证...")
-            verify_clicked = False
-            
-            # 新增：给前端框架一点时间反应，激活验证按钮
-            time.sleep(1.5)
-
-            for sel in [
-                '//button[contains(., "Verify Code")]',
-                '//span[contains(., "Verify Code")]',
-                '//button[contains(., "Verify")]',  # 扩大匹配范围
-                'button[type="submit"]',
-            ]:
-                try:
-                    if sb.is_element_visible(sel):
-                        sb.click(sel)
-                        verify_clicked = True
-                        print(f"✅ 常规点击[验证]成功 ({sel})")
-                        break
-                except Exception:
-                    continue
-
-            # ================= 新增：JS 强制点击兜底 =================
-            if not verify_clicked:
-                try:
-                    sb.execute_script("document.querySelector('button[type=\"submit\"]').click();")
-                    verify_clicked = True
-                    print("✅ JS 强制点击[验证]成功")
-                except Exception:
-                    pass
-            # =========================================================
-
-            if not verify_clicked:
-                print("❌ 验证按钮缺失")
-                sb.save_screenshot("kerit_no_verify_btn.png")
-                send_tg("❌ 验证按钮缺失", ip_info=ip_info, email=MASKED_EMAIL)
-                return
-
-            print("⏳ 等待登录跳转...")
-            for _ in range(80):
-                try:
-                    url = sb.get_current_url()
-                    if "/session" in url:
-                        print("✅ 登录成功！")
-                        break
-                except Exception:
-                    pass
+                print("✅ OTP 已填入")
                 time.sleep(0.5)
-            else:
-                print("❌ 登录等待超时")
-                sb.save_screenshot("kerit_login_timeout.png")
-                send_tg("❌ 登录等待超时", ip_info=ip_info, email=MASKED_EMAIL)
+
+                print("🚀 点击验证...")
+                verify_clicked = False
+                for sel in [
+                    '//button[contains(., "Verify Code")]',
+                    '//span[contains(., "Verify Code")]',
+                    'button[type="submit"]',
+                ]:
+                    try:
+                        if sb.is_element_visible(sel):
+                            sb.click(sel)
+                            verify_clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if not verify_clicked:
+                    print("❌ 验证按钮缺失")
+                    sb.save_screenshot("kerit_no_verify_btn.png")
+                    send_tg("❌ 验证按钮缺失", ip_info=ip_info, email=MASKED_EMAIL)
+                    return
+
+                print("⏳ 等待登录跳转...")
+                for _ in range(80):
+                    try:
+                        url = sb.get_current_url()
+                        if "/session" in url:
+                            print("✅ 登录成功！")
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                else:
+                    print("❌ 登录等待超时")
+                    sb.save_screenshot("kerit_login_timeout.png")
+                    send_tg("❌ 登录等待超时", ip_info=ip_info, email=MASKED_EMAIL)
+                    return
+                login_ok = True
+
+            if not login_ok:
+                print("❌ 所有登录方式均失败")
+                send_tg("❌ 登录失败（Cookie 和邮箱/OTP 均无效）", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
             do_renew(sb, ip_info, MASKED_EMAIL)
