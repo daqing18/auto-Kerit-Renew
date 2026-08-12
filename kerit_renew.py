@@ -1,8 +1,13 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Kerit 免费服务器自动续期脚本
+优化版：使用 sing-box 代理（由外部 setup_proxy.sh 管理），
+       Turnstile 使用 seleniumbase uc_gui_click_captcha() 内置解法
+"""
 import os
 import time
 import json
-import socket
-import signal
 import imaplib
 import email
 import re
@@ -10,7 +15,6 @@ import subprocess
 import urllib.request
 import urllib.parse
 import requests
-from urllib.parse import unquote, urlparse, parse_qs
 from seleniumbase import SB
 
 # ============================================================
@@ -18,7 +22,7 @@ from seleniumbase import SB
 # ============================================================
 
 def mask_email(email_str: str) -> str:
-    """掩码邮箱：保留第一个字符和@前最后一个字符，其他用*替代"""
+    """掩码邮箱"""
     parts = email_str.split("@")
     local = parts[0]
     domain = parts[1]
@@ -26,6 +30,11 @@ def mask_email(email_str: str) -> str:
         return local[0] + "*" * (len(local) - 2) + local[-1] + "@" + domain
     else:
         return local[0] + "*" * max(0, len(local) - 1) + ("" if len(local) == 1 else local[-1]) + "@" + domain
+
+
+def mask_ip(ip: str) -> str:
+    """脱敏 IP 地址"""
+    return ip.rsplit(".", 1)[0] + ".***"
 
 
 # ============================================================
@@ -36,16 +45,16 @@ _account = os.environ["KERIT_ACCOUNT"].split(",")
 KERIT_EMAIL    = _account[0].strip()
 GMAIL_PASSWORD = _account[1].strip()
 
-# 代理配置
-HY2_PROXY_URL = os.getenv('HY2_PROXY_URL', "")
-SOCKS_PORT = int(os.getenv('SOCKS_PORT', '51080'))
-
-# 邮箱掩码
 MASKED_EMAIL = mask_email(KERIT_EMAIL)
 
 LOGIN_URL      = "https://billing.kerit.cloud/"
 FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
 
+# ---- 代理配置（sing-box 模式，由 setup_proxy.sh 设置环境变量） ----
+IS_PROXY     = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "socks5://127.0.0.1:1080").strip()
+
+# ---- TG 通知 ----
 _tg_raw = os.environ.get("TG_BOT", "")
 if _tg_raw and "," in _tg_raw:
     _tg = _tg_raw.split(",")
@@ -57,130 +66,36 @@ else:
 
 
 # ============================================================
-# Hy2 代理管理
+# 网络 / IP 检测
 # ============================================================
 
-class Hy2Proxy:
-    """Hysteria2 代理管理器"""
-    def __init__(self, url: str):
-        self.url = url
-        self.proc = None
-
-    def start(self) -> bool:
-        print("📡 启动 Hysteria2…")
-
-        u = self.url.replace("hysteria2://", "").replace("hy2://", "")
-        parsed = urlparse("scheme://" + u)
-        params = parse_qs(parsed.query)
-
-        # 处理 insecure 参数（支持 insecure 和 allowInsecure）
-        insecure_val = params.get("insecure", params.get("allowInsecure", ["0"]))[0]
-        insecure = insecure_val == "1"
-
-        cfg = {
-            "server": f"{parsed.hostname}:{parsed.port}",
-            "auth": unquote(parsed.username),
-            "tls": {
-                "sni": params.get("sni", [parsed.hostname])[0],
-                "insecure": insecure,
-                "alpn": params.get("alpn", ["h3"]),
-            },
-            "socks5": {"listen": f"127.0.0.1:{SOCKS_PORT}"}
-        }
-
-        cfg_path = "/tmp/hy2.json"
-        with open(cfg_path, "w") as f:
-            json.dump(cfg, f)
-
-        try:
-            self.proc = subprocess.Popen(
-                ["hysteria", "client", "-c", cfg_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
-        except FileNotFoundError:
-            print("❌ hysteria 命令未找到，请先安装 Hysteria2")
-            return False
-
-        for _ in range(12):
-            time.sleep(1)
-            with socket.socket() as s:
-                if s.connect_ex(("127.0.0.1", SOCKS_PORT)) == 0:
-                    print("✅ Hy2 SOCKS5 已就绪")
-                    return True
-        return False
-
-    def stop(self):
-        if self.proc:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-            print("🛑 Hy2 已停止")
-
-    @property
-    def proxy(self):
-        return f"socks5://127.0.0.1:{SOCKS_PORT}"
-
-
-def get_proxy_manager():
-    """根据环境变量判断是否需要使用代理"""
-    if HY2_PROXY_URL:
-        return Hy2Proxy(HY2_PROXY_URL)
-    return None
-
-
-def mask_ip(ip: str) -> str:
-    """脱敏 IP 地址"""
-    return ip.rsplit(".", 1)[0] + ".***"
-
-
-def check_ip(proxy: str = None) -> str:
-    """检查落地 IP，明确指出是否使用了代理"""
+def get_public_ip(proxy_url: str = "") -> str:
+    """获取当前出口 IP"""
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     try:
-        proxies = None
-        if proxy:
-            proxies = {"http": proxy, "https": proxy}
+        r = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+        r.raise_for_status()
+        return r.text.strip()
+    except Exception:
+        return "未知"
+
+
+def check_ip_info(proxy_url: str = "") -> str:
+    """获取 IP 地理位置信息"""
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    try:
         r = requests.get(
             "http://ip-api.com/json/?fields=status,query,countryCode",
-            proxies=proxies,
-            timeout=30
+            proxies=proxies, timeout=30
         ).json()
         if r.get("status") == "success":
             ip_str = f"{mask_ip(r['query'])} ({r['countryCode']})"
-            mode = "✅ 代理" if proxy else "⚠️ 直连"
+            mode = "✅ 代理" if proxy_url else "⚠️ 直连"
             return f"{ip_str} [{mode}]"
     except Exception:
         pass
-    mode = "✅ 代理" if proxy else "⚠️ 直连"
+    mode = "✅ 代理" if proxy_url else "⚠️ 直连"
     return f"未知 IP [{mode}]"
-
-
-def start_proxy_with_retry(max_retries=3):
-    """启动代理，失败时重试"""
-    if not HY2_PROXY_URL:
-        print("⚠️ 未配置代理 URL，使用直连模式")
-        return None, None
-
-    proxy_manager = get_proxy_manager()
-    proxy_url = None
-
-    if not proxy_manager:
-        print("⚠️ 代理管理器初始化失败，使用直连模式")
-        return None, None
-
-    for attempt in range(1, max_retries + 1):
-        print(f"🔄 尝试启动代理 ({attempt}/{max_retries})...")
-        if proxy_manager.start():
-            proxy_url = proxy_manager.proxy
-            print(f"✅ 代理已启动：{proxy_url}")
-            return proxy_manager, proxy_url
-        else:
-            if attempt < max_retries:
-                print(f"⏳ 等待 5 秒后重试...")
-                time.sleep(5)
-            else:
-                print("⚠️ 代理启动失败，继续使用直连模式")
-
-    return None, None
 
 
 # ============================================================
@@ -191,6 +106,7 @@ def now_str():
     import datetime
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+
 def send_tg(result, server_id=None, remaining=None, ip_info=None, email=None):
     lines = [
         f"🎮 Kerit 服务器续期通知",
@@ -198,9 +114,7 @@ def send_tg(result, server_id=None, remaining=None, ip_info=None, email=None):
     ]
     if email:
         tg_user_id = TG_CHAT_ID if TG_CHAT_ID else "0000"
-        tg_user_link = f'<a href="tg://user?id={tg_user_id}">{email}</a>'
-        lines.append(f"📮 邮箱: {tg_user_link}")
-
+        lines.append(f"📮 邮箱: {email}")
     lines.append(f"📊 续期结果: {result}")
     if server_id is not None:
         lines.append(f"🖥 服务器ID: {server_id}")
@@ -208,6 +122,7 @@ def send_tg(result, server_id=None, remaining=None, ip_info=None, email=None):
         lines.append(f"⏱️ 剩余天数: {remaining}天")
     if ip_info:
         lines.append(f"🌐 IP信息: {ip_info}")
+
     msg = "\n".join(lines)
     if not TG_TOKEN or not TG_CHAT_ID:
         print("⚠️ TG未配置，跳过推送")
@@ -239,12 +154,10 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
         mail.login(KERIT_EMAIL, GMAIL_PASSWORD)
     except imaplib.IMAP4.error as e:
         print(f"❌ Gmail 认证失败: {e}")
-        print("💡 请检查:")
-        print("   1. KERIT_ACCOUNT 环境变量是否正确")
-        print("   2. Gmail 是否启用了 IMAP 访问")
-        print("   3. 是否需要使用应用专用密码而不是账户密码")
+        print("💡 请检查: 1.KERIT_ACCOUNT 环境变量  2.Gmail IMAP 已开启  3.使用应用专用密码")
         raise TimeoutError(f"Gmail 认证失败: {e}")
 
+    # 查找垃圾箱
     spam_folder = None
     _, folder_list = mail.list()
     for f in folder_list:
@@ -264,12 +177,11 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
     else:
         print("⚠️ 未找到垃圾邮箱")
 
+    # 记录已见 UID
     seen_uids = {}
     for folder in folders_to_check:
         try:
-            status, _ = mail.select(folder)
-            if status != "OK":
-                raise Exception(f"select失败: {status}")
+            mail.select(folder)
             _, data = mail.uid("search", None, "ALL")
             seen_uids[folder] = set(data[0].split())
         except Exception as e:
@@ -278,12 +190,9 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
 
     while time.time() < deadline:
         time.sleep(5)
-
         for folder in folders_to_check:
             try:
-                status, _ = mail.select(folder)
-                if status != "OK":
-                    continue
+                mail.select(folder)
                 _, data = mail.uid("search", None, 'FROM "kerit"')
                 all_uids = set(data[0].split())
                 new_uids = all_uids - seen_uids[folder]
@@ -315,17 +224,16 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
                         print(f"✅ Gmail OTP: {code}")
                         mail.logout()
                         return code
-
             except Exception as e:
-                print(f"⚠️ 检查{folder}出错: {e}")
+                print(f"⚠️ 检查 {folder} 出错: {e}")
                 continue
 
     mail.logout()
-    raise TimeoutError("❌ Gmail超时")
+    raise TimeoutError("❌ Gmail超时，未收到 OTP 邮件")
 
 
 # ============================================================
-# Turnstile 工具函数（采用 seleniumbase 内置解法，替代 xdotool）
+# Turnstile 工具函数（seleniumbase UC 模式内置解法）
 # ============================================================
 
 EXPAND_POPUP_JS = """
@@ -355,7 +263,6 @@ EXPAND_POPUP_JS = """
 })();
 """
 
-# CF 挑战页特征关键词（用于判断挑战是否已通过）
 CF_INDICATORS = [
     "verify you are human",
     "确认您是真人",
@@ -368,6 +275,7 @@ CF_INDICATORS = [
 
 
 def check_token(sb) -> bool:
+    """检查 Turnstile token 是否已填充"""
     try:
         return sb.execute_script("""
             (function(){
@@ -380,6 +288,7 @@ def check_token(sb) -> bool:
 
 
 def get_token_value(sb) -> str:
+    """获取 Turnstile token"""
     try:
         token = sb.execute_script("""
             (function(){
@@ -395,6 +304,7 @@ def get_token_value(sb) -> str:
 
 
 def turnstile_exists(sb) -> bool:
+    """检测页面上是否有 Turnstile"""
     try:
         return sb.execute_script(
             "(function(){ return document.querySelector('input[name=\"cf-turnstile-response\"]') !== null; })()"
@@ -404,15 +314,13 @@ def turnstile_exists(sb) -> bool:
 
 
 def wait_for_turnstile_pass(sb, timeout=30) -> bool:
-    """等待 Turnstile/CF 挑战通过（eooce 风格：检测页面特征）"""
+    """等待 Turnstile/CF 挑战通过"""
     start = time.time()
     while time.time() - start < timeout:
         try:
-            # 1) 优先看 token 是否已填充
             if check_token(sb):
                 print("✅ Turnstile 验证已通过（token 已填充）")
                 return True
-            # 2) 检测页面是否已离开 CF 挑战特征
             page_lower = sb.get_page_source().lower()
             if not any(k in page_lower for k in CF_INDICATORS):
                 print("✅ Turnstile 验证已通过（页面已离开挑战页）")
@@ -425,15 +333,14 @@ def wait_for_turnstile_pass(sb, timeout=30) -> bool:
 
 
 def solve_turnstile(sb) -> bool:
-    """使用 seleniumbase 内置 uc_gui_click_captcha() 点击 Turnstile，替代 xdotool"""
-    # 先尝试直接把 iframe 撑开，便于点击
+    """使用 seleniumbase uc_gui_click_captcha() 点击 Turnstile（eooce 风格）"""
+    # 撑开 iframe 便于点击
     try:
         sb.execute_script(EXPAND_POPUP_JS)
         time.sleep(0.5)
     except Exception:
         pass
 
-    # 若 token 已填充，直接通过
     if check_token(sb):
         print("✅ Token 已存在")
         return True
@@ -441,9 +348,8 @@ def solve_turnstile(sb) -> bool:
     for attempt in range(1, 4):
         print(f"🖱️ 尝试点击 Turnstile ({attempt}/3)...")
         try:
-            # seleniumbase 内置 UC 模式点击验证码（自动找 challenges.cloudflare.com iframe）
             sb.uc_gui_click_captcha()
-            time.sleep(12)  # 等待 JS 验证执行
+            time.sleep(12)  # 等待 JS 验证
         except Exception as e:
             print(f"⚠️ uc_gui_click_captcha 出错: {e}")
             time.sleep(2)
@@ -452,7 +358,7 @@ def solve_turnstile(sb) -> bool:
             print("✅ Cloudflare Token 通过")
             return True
         else:
-            print(f"⏳ 第 {attempt} 次未通过，重试点击...")
+            print(f"⏳ 第 {attempt} 次未通过，重试...")
 
     print("❌ Cloudflare Token 超时")
     sb.save_screenshot("turnstile_fail.png")
@@ -486,9 +392,9 @@ def do_renew(sb, ip_info=None, email=None):
         "(function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()"
     )
     if not server_id:
-        print("❌ serverData.id缺失")
+        print("❌ serverData.id 缺失")
         sb.save_screenshot("no_server_id.png")
-        send_tg("❌ serverData.id缺失，续期失败", ip_info=ip_info, email=email)
+        send_tg("❌ serverData.id 缺失，续期失败", ip_info=ip_info, email=email)
         return
     print(f"🆔 服务器ID: {server_id}")
 
@@ -509,7 +415,7 @@ def do_renew(sb, ip_info=None, email=None):
         return
 
     if need <= 0:
-        print("🎉 已达上限7/7，无需续期")
+        print("🎉 已达上限 7/7，无需续期")
         sb.save_screenshot("renew_full.png")
         remaining = extract_remaining_days(sb)
         send_tg("✅ 无需续期（已达上限 7/7）", server_id, remaining, ip_info=ip_info, email=email)
@@ -525,7 +431,7 @@ def do_renew(sb, ip_info=None, email=None):
         print(f"📊 续期进度: {count}/7")
 
         if count >= 7:
-            print("🎉 已达上限7/7，提前结束")
+            print("🎉 已达上限 7/7，提前结束")
             sb.save_screenshot("renew_full.png")
             remaining = extract_remaining_days(sb)
             send_tg("✅ 续期完成", server_id, remaining, ip_info=ip_info, email=email)
@@ -556,27 +462,27 @@ def do_renew(sb, ip_info=None, email=None):
 
         time.sleep(2)
 
-        print("⏳ 等待Turnstile...")
+        print("⏳ 等待 Turnstile...")
         for _ in range(20):
             if turnstile_exists(sb):
-                print("🛡️ 检测到Turnstile")
+                print("🛡️ 检测到 Turnstile")
                 break
             time.sleep(1)
         else:
-            print("❌ Turnstile未出现")
+            print("❌ Turnstile 未出现")
             sb.save_screenshot(f"no_turnstile_{attempt}.png")
-            send_tg(f"❌ Turnstile未出现，第{attempt + 1}次失败", server_id, ip_info=ip_info, email=email)
+            send_tg(f"❌ Turnstile 未出现，第{attempt + 1}次失败", server_id, ip_info=ip_info, email=email)
             return
 
         if not solve_turnstile(sb):
             sb.save_screenshot(f"turnstile_fail_{attempt}.png")
-            send_tg(f"❌ Turnstile验证失败，第{attempt + 1}次", server_id, ip_info=ip_info, email=email)
+            send_tg(f"❌ Turnstile 验证失败，第{attempt + 1}次", server_id, ip_info=ip_info, email=email)
             return
 
         token = get_token_value(sb)
         if not token:
-            print("❌ Token获取失败")
-            send_tg(f"❌ Token获取失败，第{attempt + 1}次", server_id, ip_info=ip_info, email=email)
+            print("❌ Token 获取失败")
+            send_tg(f"❌ Token 获取失败，第{attempt + 1}次", server_id, ip_info=ip_info, email=email)
             return
 
         print("🎯 提交续期...")
@@ -602,6 +508,7 @@ def do_renew(sb, ip_info=None, email=None):
         except Exception:
             print(f"✅ 续期成功")
 
+        # 关闭弹窗
         try:
             sb.execute_script("document.querySelector('[data-bs-dismiss=\"modal\"]')?.click();")
         except Exception:
@@ -621,7 +528,7 @@ def do_renew(sb, ip_info=None, email=None):
     final_remaining = extract_remaining_days(sb)
     print(f"📊 最终进度: {final_count}/7")
     if final_count >= 7:
-        print("🎉 已达上限7/7")
+        print("🎉 已达上限 7/7")
         send_tg("✅ 续期完成", server_id, final_remaining, ip_info=ip_info, email=email)
     else:
         print(f"⚠️ 续期未达上限，当前{final_count}/7")
@@ -633,22 +540,33 @@ def do_renew(sb, ip_info=None, email=None):
 # ============================================================
 
 def run_script():
-    print("🔧 启动浏览器...")
+    # ── 代理信息 ──
+    proxy_url = PROXY_SERVER if IS_PROXY else ""
+    if IS_PROXY:
+        print(f"🔗 使用代理: {proxy_url}")
+    else:
+        print("🍭 直连模式（未使用代理）")
 
-    # 初始化代理
-    proxy_manager, proxy_url = start_proxy_with_retry(max_retries=3)
-    ip_info = ""
+    # ── 出口 IP ──
+    try:
+        ip = get_public_ip(proxy_url)
+        print(f"📍 当前出口IP: {ip}")
+    except Exception as e:
+        print(f"⚠️ 获取出口 IP 失败: {e}")
 
-    # 检查 IP 信息
-    print(f"🔍 正在检查 IP 信息（使用代理: {bool(proxy_url)})...")
-    ip_info = check_ip(proxy_url)
-    print(f"🌐 IP 信息：{ip_info}")
+    ip_info = check_ip_info(proxy_url)
+    print(f"🌐 IP 信息: {ip_info}")
+
+    # ── 启动浏览器 ──
+    sb_kwargs = {"uc": True, "test": True}
+    if IS_PROXY:
+        sb_kwargs["proxy"] = proxy_url
 
     try:
-        with SB(uc=True, test=True, proxy=proxy_url) as sb:
+        with SB(**sb_kwargs) as sb:
             print("🚀 浏览器就绪！")
 
-            # ── IP 验证 ──────────────────────────────────────────
+            # ── IP 验证 ──
             print("🌐 验证出口IP...")
             try:
                 sb.open("https://api.ipify.org/?format=json")
@@ -658,24 +576,24 @@ def run_script():
             except Exception:
                 print("⚠️ IP验证超时，跳过")
 
-            # ── 登录 ─────────────────────────────────────────────
+            # ── 登录 ──
             print("🔑 打开登录页面...")
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
             time.sleep(3)
 
-            print("🛡️ 检查Cloudflare...")
+            print("🛡️ 检查 Cloudflare...")
             for _ in range(20):
                 time.sleep(0.5)
                 if turnstile_exists(sb):
-                    print("🛡️ 检测到Turnstile...")
+                    print("🛡️ 检测到 Turnstile...")
                     if not solve_turnstile(sb):
                         sb.save_screenshot("kerit_cf_fail.png")
-                        send_tg("❌ 登录页Turnstile验证失败", ip_info=ip_info, email=MASKED_EMAIL)
+                        send_tg("❌ 登录页 Turnstile 验证失败", ip_info=ip_info, email=MASKED_EMAIL)
                         return
                     time.sleep(2)
                     break
             else:
-                print("✅ 无Turnstile，继续")
+                print("✅ 无 Turnstile，继续")
 
             print("📭 等待邮箱框...")
             try:
@@ -710,13 +628,13 @@ def run_script():
                 send_tg("❌ 继续按钮缺失", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
-            print("📨 等待OTP框...")
+            print("📨 等待 OTP 框...")
             try:
                 sb.wait_for_element_visible('.otp-input', timeout=30)
             except Exception:
-                print("❌ OTP框加载失败")
+                print("❌ OTP 框加载失败")
                 sb.save_screenshot("kerit_no_otp.png")
-                send_tg("❌ OTP框加载失败", ip_info=ip_info, email=MASKED_EMAIL)
+                send_tg("❌ OTP 框加载失败", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
             try:
@@ -724,16 +642,16 @@ def run_script():
             except TimeoutError as e:
                 print(e)
                 sb.save_screenshot("kerit_otp_timeout.png")
-                send_tg("❌ Gmail OTP获取超时", ip_info=ip_info, email=MASKED_EMAIL)
+                send_tg("❌ Gmail OTP 获取超时", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
             otp_inputs = sb.find_elements('.otp-input')
             if len(otp_inputs) < 4:
-                print(f"❌ OTP框不足: {len(otp_inputs)}")
-                send_tg(f"❌ OTP框数量不足（{len(otp_inputs)}）", ip_info=ip_info, email=MASKED_EMAIL)
+                print(f"❌ OTP 框不足: {len(otp_inputs)}")
+                send_tg(f"❌ OTP 框数量不足（{len(otp_inputs)}）", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
-            print(f"⌨️ 填入OTP: {code}")
+            print(f"⌨️ 填入 OTP: {code}")
             for i, char in enumerate(code):
                 js = f"""
                     (function() {{
@@ -750,7 +668,7 @@ def run_script():
                 sb.execute_script(js)
                 time.sleep(0.1)
 
-            print("✅ OTP已填入")
+            print("✅ OTP 已填入")
             time.sleep(0.5)
 
             print("🚀 点击验证...")
@@ -791,9 +709,11 @@ def run_script():
                 return
 
             do_renew(sb, ip_info, MASKED_EMAIL)
-    finally:
-        if proxy_manager:
-            proxy_manager.stop()
+    except Exception as e:
+        print(f"❌ 脚本异常: {e}")
+        import traceback
+        traceback.print_exc()
+        send_tg(f"❌ 脚本异常: {e}", ip_info=ip_info, email=MASKED_EMAIL)
 
 
 if __name__ == "__main__":
