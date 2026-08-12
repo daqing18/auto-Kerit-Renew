@@ -581,27 +581,43 @@ def run_script():
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
             time.sleep(3)
 
-            print("🛡️ 检查 Cloudflare...")
-            for _ in range(20):
-                time.sleep(0.5)
-                if turnstile_exists(sb):
-                    print("🛡️ 检测到 Turnstile...")
-                    if not solve_turnstile(sb):
-                        sb.save_screenshot("kerit_cf_fail.png")
-                        send_tg("❌ 登录页 Turnstile 验证失败", ip_info=ip_info, email=MASKED_EMAIL)
-                        return
-                    time.sleep(2)
-                    break
-            else:
-                print("✅ 无 Turnstile，继续")
+            # 说明：登录页可能遇到 Cloudflare JS 挑战（challenges.cloudflare.com）
+            # 但这不是 Turnstile widget（没有 cf-turnstile-response input），
+            # 所以这里不检查 Turnstile，而是直接等待邮箱框出现，让 UC 模式自动处理挑战。
+            print("📭 等待邮箱框（UC 模式自动过 CF 挑战）...")
+            email_loaded = False
+            for _ in range(30):  # 最多等 90 秒
+                try:
+                    if sb.is_element_visible('#email-input'):
+                        email_loaded = True
+                        break
+                except Exception:
+                    pass
+                # 若页面仍停留在 CF 挑战，打印诊断信息
+                try:
+                    page_lower = sb.get_page_source().lower()
+                    if "performing security" in page_lower or "just a moment" in page_lower or "verify you are human" in page_lower:
+                        # 尝试重新连接让 UC 模式再次处理
+                        if _ % 10 == 0:
+                            print(f"⏳ 检测到 CF 挑战页，等待 UC 模式处理... ({( _ + 1) * 3}s)")
+                            try:
+                                sb.uc_gui_click_captcha()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                time.sleep(3)
 
-            print("📭 等待邮箱框...")
-            try:
-                sb.wait_for_element_visible('#email-input', timeout=20)
-            except Exception:
-                print("❌ 邮箱框加载失败")
+            if not email_loaded:
+                print("❌ 邮箱框加载失败（可能 CF 挑战未通过）")
                 sb.save_screenshot("kerit_no_email_input.png")
-                send_tg("❌ 邮箱框加载失败", ip_info=ip_info, email=MASKED_EMAIL)
+                try:
+                    with open("kerit_page_source.html", "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                    print("📄 已保存页面源码: kerit_page_source.html")
+                except Exception:
+                    pass
+                send_tg("❌ 邮箱框加载失败（CF 挑战或页面结构变化）", ip_info=ip_info, email=MASKED_EMAIL)
                 return
 
             sb.type('#email-input', KERIT_EMAIL)
