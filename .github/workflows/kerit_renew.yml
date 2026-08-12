@@ -40,12 +40,6 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: ⏳ 添加随机延迟（避免定时触发时间过于固定）
-        run: |
-          delay=$((RANDOM % 120))
-          echo "随机延迟: ${delay}秒"
-          sleep $delay
-
       - name: 🚀 运行续期脚本
         env:
           PYTHONIOENCODING: utf-8
