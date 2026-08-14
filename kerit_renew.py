@@ -144,8 +144,9 @@ class KeritCloudRenewal:
             try:
                 url = sb.get_current_url()
                 self.log(f"当前URL:{url}")
-                if "kerit.cloud" in url:
-                    self.log("✅ OAuth完成")
+                # 修复误判：如果在根目录登录页，不能算作授权完成
+                if "kerit.cloud" in url and "login" not in url.lower() and url.strip("/") != "https://billing.kerit.cloud":
+                    self.log("✅ OAuth完成 (已成功进入面板后台)")
                     return True
             except Exception:
                 pass
@@ -156,9 +157,37 @@ class KeritCloudRenewal:
     def click_discord_login(self, sb):
         try:
             self.log("🔍 等待 Discord 登录按钮...")
-            sb.wait_for_element_visible('a[href="/auth/discord"]', timeout=20)
-            sb.click('a[href="/auth/discord"]')
-            self.log("✅ Discord 登录按钮点击成功")
+            # 扩大选择器范围，适配前端可能的变化
+            selectors = [
+                'a[href="/auth/discord"]',
+                '//button[contains(., "Continue with Discord")]',
+                '//span[contains(., "Continue with Discord")]',
+                '//a[contains(., "Discord")]'
+            ]
+            clicked = False
+            for sel in selectors:
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.click(sel)
+                        clicked = True
+                        self.log(f"✅ Discord 登录按钮点击成功 ({sel})")
+                        break
+                except:
+                    continue
+            
+            if not clicked:
+                # 尝试用 JS 点击包含 discord 字符的按钮
+                sb.execute_script("""
+                    let btns = document.querySelectorAll('button, a');
+                    for (let b of btns) {
+                        if ((b.innerText || '').toLowerCase().includes('discord')) {
+                            b.click();
+                            return;
+                        }
+                    }
+                """)
+                self.log("✅ 尝试使用 JS 强制点击 Discord 按钮")
+                
             return True
         except Exception as e:
             self.log(f"❌ Discord 登录点击失败: {e}")
@@ -250,24 +279,28 @@ class KeritCloudRenewal:
             return False
 
     def cloudflare_all_page(self, sb):
-        self.log("⏳ 全页Cloudflare挑战")
-        cf_indicators = [
-            "verify you are human",
-            "确认您是真人",
-            "troubleshoot",
-            "just a moment"
-        ]
-        for i in range(2): 
-            sb.uc_gui_click_captcha()
-            time.sleep(15)
+        self.log("⏳ 处理 Cloudflare 挑战...")
+        cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment", "checking your browser"]
+        
+        for _ in range(5): # 最多尝试5次，总计约 60 秒
             page_lower = sb.get_page_source().lower()
-            if any(x in page_lower for x in cf_indicators):
-                sb.uc_gui_handle_captcha()
-                time.sleep(15)
-                page_lower = sb.get_page_source().lower()
             if not any(x in page_lower for x in cf_indicators):
-                self.log("✅Cloudflare验证已通过")
-                break
+                self.log("✅ Cloudflare 验证已通过 (或未遇到挑战)")
+                return True
+            
+            self.log("🛡️ 检测到 CF 盾，尝试处理...")
+            try:
+                sb.uc_gui_click_captcha()
+            except:
+                pass
+            time.sleep(12)
+        
+        # 最后再检查一次
+        page_lower = sb.get_page_source().lower()
+        if any(x in page_lower for x in cf_indicators):
+            self.log("❌ Cloudflare 验证超时失败")
+            return False
+        return True
 
     def check_renewal_status(self, sb):
         try:
@@ -356,7 +389,13 @@ class KeritCloudRenewal:
                 self.log("📂 进入登录页面")
                 sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=25)
                 time.sleep(10)
-                self.cloudflare_all_page(sb)
+                
+                # 如果 CF 没过，直接停止，不要盲目往下执行
+                if not self.cloudflare_all_page(sb):
+                    self.log("❌ 无法绕过 Cloudflare，停止续期流程。大概率是代理节点IP质量差被拦截。")
+                    sb.save_screenshot(f"{self.screenshot_dir}/cf_failed.png")
+                    self.send_telegram_notify("❌ Cloudflare 拦截，续期失败", f"{self.screenshot_dir}/cf_failed.png")
+                    return
                               
                 self.log("📂 授权登录页面")
                 self.click_discord_login(sb)
