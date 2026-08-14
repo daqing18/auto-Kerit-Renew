@@ -1,943 +1,410 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Kerit 免费服务器自动续期脚本
-优化版：使用 sing-box 代理（由外部 setup_proxy.sh 管理），
-       Turnstile 使用 seleniumbase uc_gui_click_captcha() 内置解法
-"""
-import os
 import time
+import os
 import json
-import imaplib
-import email
 import re
-import subprocess
-import urllib.request
-import urllib.parse
+import random
 import requests
+
+# 智能环境配置：仅在未设置时才应用默认值
+# 这样兼容 GitHub Actions 的 xvfb-run (会自动设置 DISPLAY) 和 Docker 环境
+if "DISPLAY" not in os.environ:
+    os.environ["DISPLAY"] = ":1"
+    
+if "XAUTHORITY" not in os.environ:
+    # 仅当路径存在时才设置，避免在 GitHub Runner (home/runner) 中报错
+    if os.path.exists("/home/headless/.Xauthority"):
+        os.environ["XAUTHORITY"] = "/home/headless/.Xauthority"
+
+print(f"[DEBUG] Env DISPLAY: {os.environ.get('DISPLAY')}")
+print(f"[DEBUG] Env XAUTHORITY: {os.environ.get('XAUTHORITY')}")
+
 from seleniumbase import SB
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 
-# ============================================================
-# 工具函数
-# ============================================================
+# ================= 配置区域 =================
+EMAIL = os.getenv("EMAIL")  # discord邮箱
+PASSWORD = os.getenv("PASSWORD")  # discord密码
+TG_TOKEN = os.getenv("TG_TOKEN")  # tg通知token
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")  # tg通知chat_id
 
-def mask_email(email_str: str) -> str:
-    """掩码邮箱"""
-    parts = email_str.split("@")
-    local = parts[0]
-    domain = parts[1]
-    if len(local) > 2:
-        return local[0] + "*" * (len(local) - 2) + local[-1] + "@" + domain
-    else:
-        return local[0] + "*" * max(0, len(local) - 1) + ("" if len(local) == 1 else local[-1]) + "@" + domain
+# 自动挂载 sing-box 代理
+SOCKS5_URL = os.getenv("PROXY_SERVER", "")
+if not SOCKS5_URL and os.getenv("NODE_LINK"):
+    SOCKS5_URL = "socks5://127.0.0.1:1080" # setup_proxy.sh 默认的本地 socks5 端口
 
+# 目标 URL
+DISCORD_URL = "https://discord.com/login"
+LOGIN_URL = "https://billing.kerit.cloud"
+MAIN_URL = "https://billing.kerit.cloud/free_panel"
+# ===========================================
 
-def mask_ip(ip: str) -> str:
-    """脱敏 IP 地址"""
-    return ip.rsplit(".", 1)[0] + ".***"
+class KeritCloudRenewal:
+    def __init__(self):
+        self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        self.screenshot_dir = os.path.join(self.BASE_DIR, "artifacts")
+        if not os.path.exists(self.screenshot_dir):
+            os.makedirs(self.screenshot_dir)
 
+    def log(self, msg):
+        timestamp = time.strftime('%H:%M:%S')
+        print(f"[{timestamp}] [INFO] {msg}", flush=True)
 
-# ============================================================
-# 配置（从环境变量读取）
-# ============================================================
+    def human_wait(self, min_s=6, max_s=10):
+        """随机模拟人类等待时间"""
+        time.sleep(random.uniform(min_s, max_s))
 
-_account = os.environ["KERIT_ACCOUNT"].split(",")
-KERIT_EMAIL    = _account[0].strip()
-GMAIL_PASSWORD = _account[1].strip()
-
-MASKED_EMAIL = mask_email(KERIT_EMAIL)
-
-LOGIN_URL      = "https://billing.kerit.cloud/"
-FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
-
-# ---- Cookie 登录（优先使用，跳过 CF 挑战和邮箱/OTP 流程） ----
-KERIT_COOKIE_CF_CLEARANCE = os.environ.get("KERIT_COOKIE_CF_CLEARANCE", "").strip()
-KERIT_COOKIE_SESSION_ID   = os.environ.get("KERIT_COOKIE_SESSION_ID", "").strip()
-USE_COOKIE_LOGIN = bool(KERIT_COOKIE_CF_CLEARANCE and KERIT_COOKIE_SESSION_ID)
-
-# ---- 代理配置（sing-box 模式，由 setup_proxy.sh 设置环境变量） ----
-IS_PROXY     = os.environ.get("IS_PROXY", "false").lower() == "true"
-PROXY_SERVER = os.environ.get("PROXY_SERVER", "socks5://127.0.0.1:1080").strip()
-
-# ---- TG 通知 ----
-_tg_raw = os.environ.get("TG_BOT", "")
-if _tg_raw and "," in _tg_raw:
-    _tg = _tg_raw.split(",")
-    TG_CHAT_ID = _tg[0].strip()
-    TG_TOKEN   = _tg[1].strip()
-else:
-    TG_CHAT_ID = ""
-    TG_TOKEN   = ""
-
-
-# ============================================================
-# 网络 / IP 检测
-# ============================================================
-
-def get_public_ip(proxy_url: str = "") -> str:
-    """获取当前出口 IP"""
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    try:
-        r = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        r.raise_for_status()
-        return r.text.strip()
-    except Exception:
-        return "未知"
-
-
-def check_ip_info(proxy_url: str = "") -> str:
-    """获取 IP 地理位置信息"""
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    try:
-        r = requests.get(
-            "http://ip-api.com/json/?fields=status,query,countryCode",
-            proxies=proxies, timeout=30
-        ).json()
-        if r.get("status") == "success":
-            ip_str = f"{mask_ip(r['query'])} ({r['countryCode']})"
-            mode = "✅ 代理" if proxy_url else "⚠️ 直连"
-            return f"{ip_str} [{mode}]"
-    except Exception:
-        pass
-    mode = "✅ 代理" if proxy_url else "⚠️ 直连"
-    return f"未知 IP [{mode}]"
-
-
-# ============================================================
-# TG 推送
-# ============================================================
-
-def now_str():
-    import datetime
-    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-
-def send_tg(result, server_id=None, remaining=None, ip_info=None, email=None):
-    lines = [
-        f"🎮 Kerit 服务器续期通知",
-        f"🕐 运行时间: {now_str()}",
-    ]
-    if email:
-        tg_user_id = TG_CHAT_ID if TG_CHAT_ID else "0000"
-        lines.append(f"📮 邮箱: {email}")
-    lines.append(f"📊 续期结果: {result}")
-    if server_id is not None:
-        lines.append(f"🖥 服务器ID: {server_id}")
-    if remaining is not None:
-        lines.append(f"⏱️ 剩余天数: {remaining}天")
-    if ip_info:
-        lines.append(f"🌐 IP信息: {ip_info}")
-
-    msg = "\n".join(lines)
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("⚠️ TG未配置，跳过推送")
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": TG_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-    }).encode()
-    try:
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            print(f"📨 TG推送成功")
-    except Exception as e:
-        print(f"⚠️ TG推送失败：{e}")
-
-
-# ============================================================
-# IMAP 读取 Gmail OTP
-# ============================================================
-
-def fetch_otp_from_gmail(wait_seconds=60) -> str:
-    print(f"📬 连接Gmail，等待{wait_seconds}s...")
-    deadline = time.time() + wait_seconds
-
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(KERIT_EMAIL, GMAIL_PASSWORD)
-    except imaplib.IMAP4.error as e:
-        print(f"❌ Gmail 认证失败: {e}")
-        print("💡 请检查: 1.KERIT_ACCOUNT 环境变量  2.Gmail IMAP 已开启  3.使用应用专用密码")
-        raise TimeoutError(f"Gmail 认证失败: {e}")
-
-    # 查找垃圾箱
-    spam_folder = None
-    _, folder_list = mail.list()
-    for f in folder_list:
-        decoded = f.decode("utf-8", errors="ignore")
-        if any(k in decoded for k in ["Spam", "Junk", "垃圾", "spam", "junk"]):
-            match = re.search(r'"([^"]+)"\s*$', decoded)
-            if not match:
-                match = re.search(r'(\S+)\s*$', decoded)
-            if match:
-                spam_folder = match.group(1).strip('"')
-                print(f"🗑️ 检查Gmail垃圾邮箱")
-                break
-
-    folders_to_check = ["INBOX"]
-    if spam_folder:
-        folders_to_check.append(spam_folder)
-    else:
-        print("⚠️ 未找到垃圾邮箱")
-
-    # 记录已见 UID
-    seen_uids = {}
-    for folder in folders_to_check:
+    def move_mouse_human(self, sb):
+        """模拟人类鼠标晃动预热"""
         try:
-            mail.select(folder)
-            _, data = mail.uid("search", None, "ALL")
-            seen_uids[folder] = set(data[0].split())
+            for _ in range(3):
+                x = random.randint(100, 800)
+                y = random.randint(100, 600)
+                sb.slow_click(f"body", force=True)
+                time.sleep(random.uniform(0.5, 1.2))
+        except: pass
+
+    def send_telegram_notify(self, message, photo_path=None):
+        """发送 Telegram 通知 (带图片)"""
+        if not TG_TOKEN or not TG_CHAT_ID:
+            self.log("⚠️ 未配置 TG_TOKEN 或 TG_CHAT_ID，跳过推送。")
+            return
+        
+        try:
+            if photo_path and os.path.exists(photo_path):
+                url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+                with open(photo_path, 'rb') as f:
+                    requests.post(url, data={'chat_id': TG_CHAT_ID, 'caption': message}, files={'photo': f})
+            else:
+                url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+                requests.post(url, data={'chat_id': TG_CHAT_ID, 'text': message})
+            
+            self.log("✅ TG 推送已发送")
         except Exception as e:
-            print(f"⚠️ 文件夹异常 {folder}: {e}")
-            seen_uids[folder] = set()
+            self.log(f"❌ TG 推送失败: {e}")
 
-    while time.time() < deadline:
-        time.sleep(5)
-        for folder in folders_to_check:
+    def discord_login(self, sb, EMAIL, PASSWORD):
+        self.log("✏️ 输入账号密码")
+        sb.fill('input[name="email"]', EMAIL)
+        sb.fill('input[name="password"]', PASSWORD)
+        self.log("📤 提交登录")
+        sb.click('button[type="submit"]')
+        time.sleep(10)
+
+    # ======================
+    # OAuth
+    # ======================
+    def oauth_debug(self, sb):
+        self.log("🔐 OAuth 页面分析开始")
+        for i in range(40):
+            self.log(f"🔍 分析 {i+1}/40")
+            time.sleep(2)
+
             try:
-                mail.select(folder)
-                _, data = mail.uid("search", None, 'FROM "kerit"')
-                all_uids = set(data[0].split())
-                new_uids = all_uids - seen_uids[folder]
+                self.log("🔍 查找 Discord 授权按钮")
+                buttons = sb.find_elements("button")
+                self.log(f"找到按钮数量: {len(buttons)}")
 
-                for uid in new_uids:
-                    seen_uids[folder].add(uid)
-                    _, msg_data = mail.uid("fetch", uid, "(RFC822)")
-                    raw = msg_data[0][1]
-                    msg = email.message_from_bytes(raw)
+                for btn in buttons:
+                    try:
+                        text = (btn.text or "").strip()
+                        self.log(f"按钮: {repr(text)}")
 
-                    body = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            if part.get_content_type() == "text/plain":
-                                body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                                break
-                        if not body:
-                            for part in msg.walk():
-                                if part.get_content_type() == "text/html":
-                                    html = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                                    body = re.sub(r'<[^>]+>', ' ', html)
-                                    break
-                    else:
-                        body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        if "继续滚动" in text:
+                            self.log("🟡 发现继续滚动按钮")
+                            sb.execute_script("""
+                                let els=document.querySelectorAll('*');
+                                for(let el of els){
+                                    try{
+                                        if(el.scrollHeight>el.clientHeight){
+                                            el.scrollTop=el.scrollHeight;
+                                        }
+                                    }catch(e){}
+                                }
+                            """)
+                            time.sleep(2)
+                            sb.execute_script('document.querySelectorAll("button")[1].click();')
+                            self.log("✅ 已点击继续滚动")
+                            time.sleep(5)
+                            break
 
-                    otp = re.search(r'\b(\d{4})\b', body)
-                    if otp:
-                        code = otp.group(1)
-                        print(f"✅ Gmail OTP: {code}")
-                        mail.logout()
-                        return code
+                        if "授权" in text or text == "Authorize" or text == "Authorise":
+                            self.log("🟢 找到授权按钮")
+                            sb.execute_script('document.querySelectorAll("button")[1].click();')
+                            self.log("✅ OAuth授权点击完成")
+                            time.sleep(8)
+                            break
+
+                    except Exception as e:
+                        self.log(f"按钮处理错误: {e}")
+
             except Exception as e:
-                print(f"⚠️ 检查 {folder} 出错: {e}")
-                continue
+                self.log(f"OAuth按钮检测失败: {e}")
 
-    mail.logout()
-    raise TimeoutError("❌ Gmail超时，未收到 OTP 邮件")
-
-
-# ============================================================
-# Turnstile 工具函数（seleniumbase UC 模式内置解法）
-# ============================================================
-
-EXPAND_POPUP_JS = """
-(function() {
-    var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
-    if (!turnstileInput) return;
-    var el = turnstileInput;
-    for (var i = 0; i < 20; i++) {
-        el = el.parentElement;
-        if (!el) break;
-        var style = window.getComputedStyle(el);
-        if (style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden') {
-            el.style.overflow = 'visible';
-        }
-        el.style.minWidth = 'max-content';
-    }
-    var iframes = document.querySelectorAll('iframe');
-    iframes.forEach(function(iframe) {
-        if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
-            iframe.style.width = '300px';
-            iframe.style.height = '65px';
-            iframe.style.minWidth = '300px';
-            iframe.style.visibility = 'visible';
-            iframe.style.opacity = '1';
-        }
-    });
-})();
-"""
-
-CF_INDICATORS = [
-    "verify you are human",
-    "确认您是真人",
-    "just a moment...",
-    "checking your browser",
-    "troubleshoot",
-    "cf-chl",
-    "challenges.cloudflare.com",
-]
-
-
-def check_token(sb) -> bool:
-    """检查 Turnstile token 是否已填充"""
-    try:
-        return sb.execute_script("""
-            (function(){
-                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                return input && input.value && input.value.length > 20;
-            })()
-        """)
-    except Exception:
-        return False
-
-
-def get_token_value(sb) -> str:
-    """获取 Turnstile token"""
-    try:
-        token = sb.execute_script("""
-            (function(){
-                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                return (input && input.value) ? input.value : '';
-            })()
-        """)
-        if token and len(token) > 20:
-            return token
-    except Exception:
-        pass
-    return ''
-
-
-def turnstile_exists(sb) -> bool:
-    """检测页面上是否有 Turnstile"""
-    try:
-        return sb.execute_script(
-            "(function(){ return document.querySelector('input[name=\"cf-turnstile-response\"]') !== null; })()"
-        )
-    except Exception:
-        return False
-
-
-def wait_for_turnstile_pass(sb, timeout=30) -> bool:
-    """等待 Turnstile/CF 挑战通过"""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            if check_token(sb):
-                print("✅ Turnstile 验证已通过（token 已填充）")
-                return True
-            page_lower = sb.get_page_source().lower()
-            if not any(k in page_lower for k in CF_INDICATORS):
-                print("✅ Turnstile 验证已通过（页面已离开挑战页）")
-                return True
-        except Exception:
-            pass
-        sb.sleep(1)
-    print("❌ Turnstile 验证超时未通过")
-    return False
-
-
-def solve_turnstile(sb) -> bool:
-    """使用 seleniumbase uc_gui_click_captcha() 点击 Turnstile（eooce 风格）"""
-    # 撑开 iframe 便于点击
-    try:
-        sb.execute_script(EXPAND_POPUP_JS)
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-    if check_token(sb):
-        print("✅ Token 已存在")
-        return True
-
-    for attempt in range(1, 4):
-        print(f"🖱️ 尝试点击 Turnstile ({attempt}/3)...")
-        try:
-            sb.uc_gui_click_captcha()
-            time.sleep(12)  # 等待 JS 验证
-        except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha 出错: {e}")
-            time.sleep(2)
-
-        if wait_for_turnstile_pass(sb, timeout=20):
-            print("✅ Cloudflare Token 通过")
-            return True
-        else:
-            print(f"⏳ 第 {attempt} 次未通过，重试...")
-
-    print("❌ Cloudflare Token 超时")
-    sb.save_screenshot("turnstile_fail.png")
-    return False
-
-
-def extract_remaining_days(sb) -> int:
-    """从 expiry-display 元素读取剩余天数"""
-    try:
-        return sb.execute_script("""
-            (function(){
-                var el = document.getElementById('expiry-display');
-                return el ? parseInt(el.innerText || "0") : 0;
-            })()
-        """) or 0
-    except Exception:
-        return 0
-
-
-# ============================================================
-# 续期流程
-# ============================================================
-
-def do_renew(sb, ip_info=None, email=None):
-    print("🔄 跳转续期页...")
-
-    # 多次尝试打开续期页，处理 Cloudflare 挑战
-    page_loaded = False
-    for attempt in range(5):
-        try:
-            sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=4)
-        except Exception:
-            time.sleep(3)
-            continue
-        time.sleep(4)
-
-        title = sb.get_title() or ""
-        page_lower = sb.get_page_source().lower()
-        is_cf_challenge = "just a moment" in title.lower() or "performing security verification" in page_lower
-
-        if not is_cf_challenge:
-            print("✅ 续期页已加载，CF 挑战已清除")
-            page_loaded = True
-            break
-        else:
-            print(f"⏳ 检测到 CF 挑战页，等待清除... (尝试 {attempt+1}/5)")
-            time.sleep(10)
-
-    if not page_loaded:
-        print("❌ CF 挑战未清除，续期失败")
-        sb.save_screenshot("free_panel_cf_stuck.png")
-        send_tg("❌ free_panel CF 挑战未通过，续期失败", ip_info=ip_info, email=email)
-        return
-
-    sb.save_screenshot("free_panel.png")
-
-    server_id = sb.execute_script(
-        "(function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()"
-    )
-    if not server_id:
-        # serverData 可能是异步加载的，等待一下
-        print("⏳ serverData.id 缺失，等待异步加载...")
-        for i in range(10):
-            time.sleep(2)
-            server_id = sb.execute_script(
-                "(function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()"
-            )
-            if server_id:
-                print(f"✅ 异步加载完成，服务器ID: {server_id}")
-                break
-        if not server_id:
-            # 诊断：打印页面上所有可能的数据结构
-            diag = sb.execute_script("""
-                (function(){
-                    var result = {};
-                    if (typeof serverData !== 'undefined') {
-                        result.serverData = JSON.stringify(serverData).substring(0, 500);
-                    }
-                    result.globals = Object.keys(window).filter(k =>
-                        ['data','server','panel','user','config','state'].some(s =>
-                            k.toLowerCase().includes(s)
-                        )
-                    ).slice(0, 20);
-                    result.title = document.title;
-                    result.text = document.body ? document.body.innerText.substring(0, 800) : '';
-                    var s = document.querySelector('#__NEXT_DATA__');
-                    if (s) result.next_data = JSON.stringify(s.textContent).substring(0, 500);
-                    return JSON.stringify(result);
-                })()
-            """)
-            print(f"🔍 页面诊断: {diag}")
-            sb.save_screenshot("no_server_id.png")
-            send_tg("❌ serverData.id 缺失，续期失败", ip_info=ip_info, email=email)
-            return
-    print(f"🆔 服务器ID: {server_id}")
-
-    initial_count = sb.execute_script("""
-        (function(){
-            var el = document.getElementById('renewal-count');
-            return el ? parseInt(el.innerText || "0") : 0;
-        })()
-    """)
-    initial_remaining = extract_remaining_days(sb)
-    need = 7 - initial_count
-    print(f"📊 当前进度: {initial_count}/7，剩余天数: {initial_remaining}天，本次需续期: {need}次")
-
-    if initial_remaining >= 7:
-        print("✅ 剩余天数已满7天，无需续期")
-        sb.save_screenshot("renew_skip.png")
-        send_tg("✅ 无需续期（剩余天数已满）", server_id, initial_remaining, ip_info=ip_info, email=email)
-        return
-
-    if need <= 0:
-        print("🎉 已达上限 7/7，无需续期")
-        sb.save_screenshot("renew_full.png")
-        remaining = extract_remaining_days(sb)
-        send_tg("✅ 无需续期（已达上限 7/7）", server_id, remaining, ip_info=ip_info, email=email)
-        return
-
-    for attempt in range(need):
-        count = sb.execute_script("""
-            (function(){
-                var el = document.getElementById('renewal-count');
-                return el ? parseInt(el.innerText || "0") : 0;
-            })()
-        """)
-        print(f"📊 续期进度: {count}/7")
-
-        if count >= 7:
-            print("🎉 已达上限 7/7，提前结束")
-            sb.save_screenshot("renew_full.png")
-            remaining = extract_remaining_days(sb)
-            send_tg("✅ 续期完成", server_id, remaining, ip_info=ip_info, email=email)
-            return
-
-        print(f"🔁 第{attempt + 1}/{need}次续期...")
-
-        # 点击 Renew Server 按钮
-        renew_clicked = False
-        for _ in range(10):
             try:
-                btns = sb.find_elements("a, button")
-                btn = next((b for b in btns if "Renew Server" in (b.text or "")), None)
-                if btn:
-                    btn.click()
-                    renew_clicked = True
-                    print("✅ 已点击「Renew Server」")
-                    break
+                url = sb.get_current_url()
+                self.log(f"当前URL:{url}")
+                if "kerit.cloud" in url:
+                    self.log("✅ OAuth完成")
+                    return True
             except Exception:
                 pass
-            time.sleep(1)
 
-        if not renew_clicked:
-            print("❌ 续期按钮缺失")
-            sb.save_screenshot("no_renew_btn.png")
-            send_tg(f"❌ 续期按钮缺失，第{attempt + 1}次失败", server_id, ip_info=ip_info, email=email)
-            return
+        self.log("❌ OAuth失败")
+        return False
 
-        time.sleep(2)
+    def click_discord_login(self, sb):
+        try:
+            self.log("🔍 等待 Discord 登录按钮...")
+            sb.wait_for_element_visible('a[href="/auth/discord"]', timeout=20)
+            sb.click('a[href="/auth/discord"]')
+            self.log("✅ Discord 登录按钮点击成功")
+            return True
+        except Exception as e:
+            self.log(f"❌ Discord 登录点击失败: {e}")
+            return False
 
-        print("⏳ 等待 Turnstile...")
-        for _ in range(20):
-            if turnstile_exists(sb):
-                print("🛡️ 检测到 Turnstile")
+    def click_sponsor_and_complete_renew(self, sb):
+        try:
+            self.log("🖱️ 点击 Sponsor visit required...")
+            sb.execute_script("""
+            (function(){
+                let el=[...document.querySelectorAll("a,button,span")].find(
+                    e => e.innerText && e.innerText.includes("Sponsor visit required")
+                );
+                if(!el) return;
+                let target=el;
+                for(let i=0;i<6;i++){
+                    if(target.tagName=="A" || target.tagName=="BUTTON" || typeof target.onclick=="function"){
+                        if(target.tagName=="A"){ target.removeAttribute("target"); }
+                        target.click();
+                        return;
+                    }
+                    target=target.parentElement;
+                    if(!target) return;
+                }
+                el.click();
+            })();
+            """)
+            self.log("✅ Sponsor点击执行完成")
+            time.sleep(3)
+
+            handles = sb.driver.window_handles
+            self.log(f"🔎 当前窗口数量: {len(handles)}")
+            for i,h in enumerate(handles):
+                self.log(f"🔎 Window {i}: {h}")
+
+            self.log("🔎 检查 Turnstile 状态")
+            state = sb.execute_script("""
+            return {
+                token: typeof renewalState !== "undefined" ? renewalState.turnstileToken : "NO",
+                hidden: document.querySelector("#cf-chl-widget-34adu_response")?.value || ""
+            };
+            """)
+            self.log(f"🔎 Turnstile状态: {state}")
+            self.log("⏳等待 Complete Renewal 激活...")
+            time.sleep(3)
+
+            self.log("🔍 查找 Complete Renewal 按钮...")
+            renew_btn = sb.find_element("#renewBtn")
+            self.log("✅ 找到 Complete Renewal")
+
+            sb.execute_script("""
+                arguments[0].scrollIntoView({block:'center'});
+                arguments[0].focus();
+            """, renew_btn)
+            time.sleep(2)
+
+            active = sb.execute_script("""
+            let el=document.activeElement;
+            return {
+                tag:el.tagName, id:el.id, text:el.innerText,
+                html: el.outerHTML.substring(0,300)
+            };
+            """)
+            self.log(f"🔎 当前焦点: {active}")
+            time.sleep(2)
+
+            self.log("↩️ 发送 ENTER")
+            sb.driver.switch_to.active_element.send_keys(Keys.ENTER)
+            self.log("✅ ENTER发送完成")
+
+            time.sleep(5)
+            renew_result = sb.execute_script("""
+            return {
+                success: document.body.innerText.includes("Server renewed successfully"),
+                error: document.body.innerText.includes("Cannot exceed 7 days validity")
+            };
+            """)
+            self.log(f"🔎 Renewal结果: {renew_result}")
+            if renew_result["success"]:
+                self.log("🎉 服务器续期成功")
+                return True
+            if renew_result["error"]:
+                self.log("⚠️ Cannot exceed 7 days validity")
+                return False
+            self.log("⚠️ 未检测到续期结果")
+            return False
+        except Exception as e:
+            self.log(f"❌ Renewal流程失败: {e}")
+            return False
+
+    def cloudflare_all_page(self, sb):
+        self.log("⏳ 全页Cloudflare挑战")
+        cf_indicators = [
+            "verify you are human",
+            "确认您是真人",
+            "troubleshoot",
+            "just a moment"
+        ]
+        for i in range(2): 
+            sb.uc_gui_click_captcha()
+            time.sleep(15)
+            page_lower = sb.get_page_source().lower()
+            if any(x in page_lower for x in cf_indicators):
+                sb.uc_gui_handle_captcha()
+                time.sleep(15)
+                page_lower = sb.get_page_source().lower()
+            if not any(x in page_lower for x in cf_indicators):
+                self.log("✅Cloudflare验证已通过")
                 break
-            time.sleep(1)
-        else:
-            print("❌ Turnstile 未出现")
-            sb.save_screenshot(f"no_turnstile_{attempt}.png")
-            send_tg(f"❌ Turnstile 未出现，第{attempt + 1}次失败", server_id, ip_info=ip_info, email=email)
-            return
 
-        if not solve_turnstile(sb):
-            sb.save_screenshot(f"turnstile_fail_{attempt}.png")
-            send_tg(f"❌ Turnstile 验证失败，第{attempt + 1}次", server_id, ip_info=ip_info, email=email)
-            return
-
-        token = get_token_value(sb)
-        if not token:
-            print("❌ Token 获取失败")
-            send_tg(f"❌ Token 获取失败，第{attempt + 1}次", server_id, ip_info=ip_info, email=email)
-            return
-
-        print("🎯 提交续期...")
-        result = sb.execute_script(f"""
-            (async function() {{
-                const res = await fetch('/api/renew', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    credentials: 'include',
-                    body: JSON.stringify({{ id: '{server_id}', captcha: '{token}' }})
-                }});
-                const data = await res.json();
-                return JSON.stringify(data);
-            }})()
-        """)
+    def check_renewal_status(self, sb):
         try:
-            import json as _json
-            res_obj = _json.loads(result)
-            if res_obj.get('success') or res_obj == {}:
-                print("✅ 续期成功")
-            else:
-                print(f"❌ 续期失败: {result}")
-        except Exception:
-            print(f"✅ 续期成功")
+            status = sb.execute_script("""
+            (function(){
+                let el=document.querySelector('#renewal-status-text');
+                return el ? (el.textContent || "").trim() : "";
+            })();
+            """)
+            subtext = sb.execute_script("""
+            (function(){
+                let el=document.querySelector('#renewal-status-subtext');
+                return el ? (el.textContent || "").trim() : "";
+            })();
+            """)
 
-        # 关闭弹窗
-        try:
-            sb.execute_script("document.querySelector('[data-bs-dismiss=\"modal\"]')?.click();")
-        except Exception:
-            pass
+            self.log(f"🔍 Renewal状态: {status}")
+            self.log(f"🔍 Renewal说明: {subtext}")
 
-        time.sleep(3)
-        sb.execute_script("window.location.reload();")
-        time.sleep(3)
+            if not status:
+                self.log("⚠️ Renewal状态为空，等待加载...")
+                for i in range(10):
+                    time.sleep(1)
+                    status = sb.execute_script("""
+                    (function(){
+                        let el=document.querySelector('#renewal-status-text');
+                        return el ? (el.innerText || "").trim() : "";
+                    })();
+                    """)
+                    if status:
+                        self.log(f"✅ 状态加载完成: {status}")
+                        break
 
-    sb.save_screenshot("renew_done.png")
-    final_count = sb.execute_script("""
-        (function(){
-            var el = document.getElementById('renewal-count');
-            return el ? parseInt(el.innerText || "0") : 0;
-        })()
-    """)
-    final_remaining = extract_remaining_days(sb)
-    print(f"📊 最终进度: {final_count}/7")
-    if final_count >= 7:
-        print("🎉 已达上限 7/7")
-        send_tg("✅ 续期完成", server_id, final_remaining, ip_info=ip_info, email=email)
-    else:
-        print(f"⚠️ 续期未达上限，当前{final_count}/7")
-        send_tg(f"⚠️ 续期未达上限（{final_count}/7）", server_id, final_remaining, ip_info=ip_info, email=email)
+            if not status:
+                self.log("⚠️ 仍未获取状态，默认继续续期")
+                return True
 
+            status_lower = status.lower()
 
-# ============================================================
-# 主流程
-# ============================================================
+            if "ready to renew" in status_lower:
+                self.log("✅ 当前可以续期")
+                return True
 
-def run_script():
-    # ── 代理信息 ──
-    proxy_url = PROXY_SERVER if IS_PROXY else ""
-    if IS_PROXY:
-        print(f"🔗 使用代理: {proxy_url}")
-    else:
-        print("🍭 直连模式（未使用代理）")
+            blocked = ["cooldown", "unavailable", "expired", "limit", "wait", "reached"]
+            for word in blocked:
+                if word in status_lower:
+                    self.log(f"⏳ 当前不可续期: {status}")
+                    return False
 
-    # ── 出口 IP ──
-    try:
-        ip = get_public_ip(proxy_url)
-        print(f"📍 当前出口IP: {ip}")
-    except Exception as e:
-        print(f"⚠️ 获取出口 IP 失败: {e}")
+            self.log(f"⚠️ 未知状态 {status}，继续尝试")
+            return True
 
-    ip_info = check_ip_info(proxy_url)
-    print(f"🌐 IP 信息: {ip_info}")
+        except Exception as e:
+            self.log(f"⚠️ 检查续期状态失败: {e}")
+            return True
+        
+    def run(self):
+        self.log("=" * 40)
+        self.log("🚀 Kerit.Cloud - Renew流程 (GitHub Actions 版)")
+        self.log("=" * 40)
+        
+        if not EMAIL or not PASSWORD:
+            self.log("❌ 严重错误: 未检测到 EMAIL 或 PASSWORD 环境变量，请在 GitHub Secrets 中配置！")
+            return
 
-    # ── 启动浏览器 ──
-    sb_kwargs = {"uc": True, "test": True}
-    if IS_PROXY:
-        sb_kwargs["proxy"] = proxy_url
-
-    try:
-        with SB(**sb_kwargs) as sb:
-            print("🚀 浏览器就绪！")
-
-            # ── IP 验证 ──
-            print("🌐 验证出口IP...")
+        self.log(f"🎯 正在启动 Chrome 浏览器... (代理: {SOCKS5_URL if SOCKS5_URL else '未配置直连'})")
+        
+        with SB(
+            uc=True,            
+            test=True, 
+            headed=True,        
+            headless=False,     
+            xvfb=False,         
+            chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-position=0,0,--start-maximized",
+            proxy=SOCKS5_URL if SOCKS5_URL else None
+        ) as sb:
             try:
-                sb.open("https://api.ipify.org/?format=json")
-                ip_text = sb.get_text('body')
-                ip_text = re.sub(r'(\d+\.\d+\.\d+\.)\d+', r'\1xx', ip_text)
-                print(f"✅ 出口IP确认：{ip_text}")
-            except Exception:
-                print("⚠️ IP验证超时，跳过")
+                self.log("✅ 浏览器已启动！")
+                self.log("🔗 访问Discord登录页...")
+                sb.uc_open_with_reconnect(DISCORD_URL, reconnect_time=25)
+                time.sleep(5)
+                self.discord_login(sb, EMAIL, PASSWORD)
+                self.log("✅ 登录Discord成功")
+                time.sleep(10)
 
-                        # ── 登录（优先 Cookie 注入，失败则回退邮箱/OTP） ──
-            login_ok = False
+                self.log("📂 进入登录页面")
+                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=25)
+                time.sleep(10)
+                self.cloudflare_all_page(sb)
+                              
+                self.log("📂 授权登录页面")
+                self.click_discord_login(sb)
+                time.sleep(15)
+                self.oauth_debug(sb)
+                time.sleep(15)
 
-            # 方式1：Cookie 注入登录（跳过 CF 挑战 + 邮箱/OTP）
-            if USE_COOKIE_LOGIN:
-                print("🍪 尝试 Cookie 注入登录...")
+                self.log("📂 点击进入续期页面")
+                sb.uc_open_with_reconnect(MAIN_URL, reconnect_time=25)
                 try:
-                    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
-                    time.sleep(2)
-                    print("📝 注入 cookie: cf_clearance, session_id ...")
-                    sb.add_cookie({"name": "cf_clearance", "value": KERIT_COOKIE_CF_CLEARANCE,
-                                   "domain": ".kerit.cloud", "path": "/"})
-                    sb.add_cookie({"name": "session_id", "value": KERIT_COOKIE_SESSION_ID,
-                                   "domain": ".kerit.cloud", "path": "/"})
-                    print("🌐 直接跳转续期页...")
-                    sb.open(FREE_PANEL_URL)
-                    time.sleep(3)
-                    current_url = sb.get_current_url()
-                    print(f"📝 当前URL: {current_url}")
-                    if "free_panel" in current_url or "/session" in current_url:
-                        page_src = sb.get_page_source().lower()
-                        if "login" not in current_url and "otp" not in current_url and "email" not in current_url.lower():
-                            print("✅ Cookie 登录成功！")
-                            login_ok = True
-                        else:
-                            print("❌ Cookie 登录失败，页面仍在登录页")
-                    else:
-                        print(f"❌ Cookie 登录失败，跳转到了: {current_url}")
-                except Exception as e:
-                    print(f"❌ Cookie 注入失败: {e}")
+                    sb.wait_for_element_present("#renewal-status-text", timeout=20)
+                    self.log("✅ 续期状态组件加载完成")
+                except:
+                    self.log("⚠️ 未检测到 renewal-status-text，检查页面")
 
-            # 方式2：邮箱/OTP 登录（Cookie 失败或禁用时回退）
-            if not login_ok:
-                if USE_COOKIE_LOGIN:
-                    print("🔄 Cookie 登录失败，回退到邮箱/OTP 登录...")
-                print("🔑 打开登录页面...")
-                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
+                if not self.check_renewal_status(sb):
+                    self.log("✅冷却中,无需续期")
+                    final_screenshot = f"{self.screenshot_dir}/final.png"
+                    sb.save_screenshot(final_screenshot)
+                    mask_mail = EMAIL[:3] + "***" + EMAIL[EMAIL.find("@"):]
+                    self.send_telegram_notify(f"🎉Kerit.Cloud\n✅账号：[{mask_mail}] 冷却中,无需续期", final_screenshot)
+                    return
+
+                self.log("✅ 点击Renew按钮")
+                self.log("🖱️ JS点击 Renew Server")
+                sb.execute_script("""
+                let btn = document.querySelector("#renewServerBtn");
+                if (!btn) {
+                    throw new Error("renewServerBtn not found");
+                }
+                btn.click();
+                """)
+                time.sleep(10)
+
+                self.log("✅ 点击sponsor按钮后并点击续期")
+                renew_success = self.click_sponsor_and_complete_renew(sb)
                 time.sleep(3)
-
-                print("📭 等待邮箱框（UC 模式自动过 CF 挑战）...")
-                email_loaded = False
-                for _ in range(30):
-                    try:
-                        if sb.is_element_visible('#email-input'):
-                            email_loaded = True
-                            break
-                    except Exception:
-                        pass
-                    try:
-                        page_lower = sb.get_page_source().lower()
-                        if "performing security" in page_lower or "just a moment" in page_lower or "verify you are human" in page_lower:
-                            if _ % 10 == 0:
-                                print(f"⏳ 检测到 CF 挑战页，等待 UC 模式处理... ({( _ + 1) * 3}s)")
-                                try:
-                                    sb.uc_gui_click_captcha()
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-                    time.sleep(3)
-
-                if not email_loaded:
-                    print("❌ 邮箱框加载失败（可能 CF 挑战未通过）")
-                    sb.save_screenshot("kerit_no_email_input.png")
-                    try:
-                        with open("kerit_page_source.html", "w", encoding="utf-8") as f:
-                            f.write(sb.get_page_source())
-                        print("📄 已保存页面源码: kerit_page_source.html")
-                    except Exception:
-                        pass
-                    send_tg("❌ 邮箱框加载失败（CF 挑战或页面结构变化）", ip_info=ip_info, email=MASKED_EMAIL)
-                    return
-
-                sb.type('#email-input', KERIT_EMAIL)
-                print(f"✅ 邮箱：{MASKED_EMAIL}")
-
-                print("🛡️ 等待 Turnstile 验证通过...")
-                turnstile_ready = False
-                for _ in range(40):
-                    try:
-                        token_val = sb.execute_script("""
-                            (function(){
-                                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                                return input && input.value && input.value.length > 20 ? input.value : '';
-                            })()
-                        """)
-                        if token_val:
-                            print("✅ Turnstile token 已填充")
-                            turnstile_ready = True
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(1)
-                if not turnstile_ready:
-                    print("⚠️ Turnstile token 未检测到，尝试点击 Turnstile 复选框...")
-                    try:
-                        sb.uc_gui_click_captcha()
-                        time.sleep(5)
-                        token_val = sb.execute_script("""
-                            (function(){
-                                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                                return input && input.value && input.value.length > 20 ? input.value : '';
-                            })()
-                        """)
-                        if token_val:
-                            print("✅ Turnstile token 已填充（点击后）")
-                            turnstile_ready = True
-                        else:
-                            print("⚠️ Turnstile 仍未通过，但继续尝试点击按钮...")
-                    except Exception as e:
-                        print(f"⚠️ uc_gui_click_captcha 失败: {e}，继续尝试...")
-
-                print("🖱️ 点击继续...")
-                clicked = False
-                for sel in [
-                    '//button[contains(., "Continue with Email")]',
-                    '//span[contains(., "Continue with Email")]',
-                    'button[type="submit"]',
-                ]:
-                    try:
-                        if sb.is_element_visible(sel):
-                            sb.click(sel)
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
-
-                if not clicked:
-                    print("❌ 继续按钮缺失")
-                    sb.save_screenshot("kerit_no_continue_btn.png")
-                    send_tg("❌ 继续按钮缺失", ip_info=ip_info, email=MASKED_EMAIL)
-                    return
-
-                print("📨 等待 OTP 框...")
-                otp_loaded = False
-                otp_selectors = ['.otp-input', 'input[autocomplete="one-time-code"]', 'input[type="tel"]', 'input[data-testid*="otp"]', 'input[class*="otp"]', 'input[class*="code"]']
-                for _ in range(60):
-                    try:
-                        for sel in otp_selectors:
-                            if sb.is_element_visible(sel):
-                                otp_loaded = True
-                                break
-                        if otp_loaded:
-                            break
-                    except Exception:
-                        pass
-                    try:
-                        if sb.is_element_visible('#email-input'):
-                            if _ % 10 == 0:
-                                print(f"⏳ 仍在邮箱页，等待 OTP 页面加载... ({_ + 1}s)")
-                    except Exception:
-                        pass
-                    time.sleep(1)
-
-                if not otp_loaded:
-                    print("❌ OTP 框加载失败")
-                    sb.save_screenshot("kerit_no_otp.png")
-                    try:
-                        with open("kerit_otp_page.html", "w", encoding="utf-8") as f:
-                            f.write(sb.get_page_source())
-                        print("📄 已保存页面源码: kerit_otp_page.html")
-                    except Exception:
-                        pass
-                    send_tg("❌ OTP 框加载失败（页面结构变化或按钮未生效）", ip_info=ip_info, email=MASKED_EMAIL)
-                    return
-
-                time.sleep(2)
-                try:
-                    code = fetch_otp_from_gmail(wait_seconds=60)
-                except TimeoutError as e:
-                    print(e)
-                    sb.save_screenshot("kerit_otp_timeout.png")
-                    send_tg("❌ Gmail OTP 获取超时", ip_info=ip_info, email=MASKED_EMAIL)
-                    return
-
-                otp_selector = '.otp-input'
-                otp_inputs = sb.find_elements(otp_selector)
-                if len(otp_inputs) < 4:
-                    for sel in ['input[autocomplete="one-time-code"]', 'input[type="tel"]', 'input[data-testid*="otp"]', 'input[class*="otp"]', 'input[class*="code"]']:
-                        otp_inputs = sb.find_elements(sel)
-                        if len(otp_inputs) >= 4:
-                            otp_selector = sel
-                            break
-                if len(otp_inputs) < 4:
-                    try:
-                        js_otp = sb.execute_script("""
-                            (function(){
-                                var inputs = document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="email"]):not([type="password"])');
-                                var visible = [];
-                                for (var i = 0; i < inputs.length; i++) {
-                                    if (inputs[i].offsetParent !== null && inputs[i].offsetWidth > 0) {
-                                        visible.push(inputs[i]);
-                                    }
-                                }
-                                return visible.length;
-                            })()
-                        """)
-                        print(f"📊 JS 查询可见 input 数量: {js_otp}")
-                        if js_otp >= 4:
-                            otp_selector = 'JS_FALLBACK'
-                    except Exception:
-                        pass
-
-                if len(otp_inputs) < 4 and otp_selector != 'JS_FALLBACK':
-                    print(f"❌ OTP 框不足: {len(otp_inputs)}")
-                    send_tg(f"❌ OTP 框数量不足（{len(otp_inputs)}）", ip_info=ip_info, email=MASKED_EMAIL)
-                    return
-
-                print(f"⌨️ 填入 OTP: {code} (选择器: {otp_selector})")
-                for i, char in enumerate(code):
-                    if otp_selector == 'JS_FALLBACK':
-                        js = f"""
-                            (function() {{
-                                var inputs = document.querySelectorAll('input:not([type="hidden"]):not([type="email"]):not([type="password"])');
-                                var visible = [];
-                                for (var j = 0; j < inputs.length; j++) {{
-                                    if (inputs[j].offsetParent !== null && inputs[j].offsetWidth > 0) {{
-                                        visible.push(inputs[j]);
-                                    }}
-                                }}
-                                var inp = visible[{i}];
-                                if (!inp) return;
-                                var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                    window.HTMLInputElement.prototype, 'value').set;
-                                nativeInputValueSetter.call(inp, '{char}');
-                                inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                inp.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
-                            }})();
-                        """
-                    else:
-                        js = f"""
-                            (function() {{
-                                var inputs = document.querySelectorAll('{otp_selector}');
-                                var inp = inputs[{i}];
-                                if (!inp) return;
-                                var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                    window.HTMLInputElement.prototype, 'value').set;
-                                nativeInputValueSetter.call(inp, '{char}');
-                                inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                inp.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
-                            }})();
-                        """
-                    sb.execute_script(js)
-                    time.sleep(0.1)
-
-                print("✅ OTP 已填入")
-                time.sleep(0.5)
-
-                print("🚀 点击验证...")
-                verify_clicked = False
-                for sel in [
-                    '//button[contains(., "Verify Code")]',
-                    '//span[contains(., "Verify Code")]',
-                    'button[type="submit"]',
-                ]:
-                    try:
-                        if sb.is_element_visible(sel):
-                            sb.click(sel)
-                            verify_clicked = True
-                            break
-                    except Exception:
-                        continue
-
-                if not verify_clicked:
-                    print("❌ 验证按钮缺失")
-                    sb.save_screenshot("kerit_no_verify_btn.png")
-                    send_tg("❌ 验证按钮缺失", ip_info=ip_info, email=MASKED_EMAIL)
-                    return
-
-                print("⏳ 等待登录跳转...")
-                for _ in range(80):
-                    try:
-                        url = sb.get_current_url()
-                        if "/session" in url:
-                            print("✅ 登录成功！")
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.5)
-                else:
-                    print("❌ 登录等待超时")
-                    sb.save_screenshot("kerit_login_timeout.png")
-                    send_tg("❌ 登录等待超时", ip_info=ip_info, email=MASKED_EMAIL)
-                    return
-                login_ok = True
-
-            if not login_ok:
-                print("❌ 所有登录方式均失败")
-                send_tg("❌ 登录失败（Cookie 和邮箱/OTP 均无效）", ip_info=ip_info, email=MASKED_EMAIL)
-                return
-
-            do_renew(sb, ip_info, MASKED_EMAIL)
-    except Exception as e:
-        print(f"❌ 脚本异常: {e}")
-        import traceback
-        traceback.print_exc()
-        send_tg(f"❌ 脚本异常: {e}", ip_info=ip_info, email=MASKED_EMAIL)
-
+                sb.scroll_to_bottom()
+                final_screenshot = f"{self.screenshot_dir}/final.png"
+                sb.save_screenshot(final_screenshot)
+                mask_mail = EMAIL[:3] + "***" + EMAIL[EMAIL.find("@"):]
+                self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{mask_mail}]\n续期流程完毕", final_screenshot)
+            
+            except Exception as e:
+                self.log(f"❌ 运行异常: {e}")
+                import traceback
+                traceback.print_exc()
+                sb.save_screenshot(f"{self.screenshot_dir}/error.png")
 
 if __name__ == "__main__":
-    run_script()
+    KeritCloudRenewal().run()
