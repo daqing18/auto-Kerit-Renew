@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Kerit 免费服务器自动续期脚本
-使用 Discord 登录 + katabump 风格过盾逻辑
+Discord 登录 + katabump 风格过盾
 变量：EMAIL, PASSWORD, TG_TOKEN, TG_CHAT_ID, NODE_LINK
 """
 import time
@@ -12,7 +12,6 @@ import re
 import random
 import requests
 
-# 智能环境配置
 if "DISPLAY" not in os.environ:
     os.environ["DISPLAY"] = ":1"
 if "XAUTHORITY" not in os.environ:
@@ -23,16 +22,13 @@ print(f"[DEBUG] Env DISPLAY: {os.environ.get('DISPLAY')}")
 print(f"[DEBUG] Env XAUTHORITY: {os.environ.get('XAUTHORITY')}")
 
 from seleniumbase import SB
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 
-# ================= 配置区域 =================
-EMAIL = os.getenv("EMAIL")         # optiklink/discord 邮箱
-PASSWORD = os.getenv("PASSWORD")   # 密码
-TG_TOKEN = os.getenv("TG_TOKEN")   # TG Bot Token
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")  # TG 聊天ID
+EMAIL = os.getenv("EMAIL")
+PASSWORD = os.getenv("PASSWORD")
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-# 代理：NODE_LINK 不为空则自动检测端口，优先 1081(HTTP)，回退 1080(SOCKS5)
 SOCKS5_URL = os.getenv("PROXY_SERVER", "")
 if not SOCKS5_URL and os.getenv("NODE_LINK"):
     import socket
@@ -43,16 +39,28 @@ if not SOCKS5_URL and os.getenv("NODE_LINK"):
             return True
         except Exception:
             return False
-    if _port_open(1081):
-        SOCKS5_URL = "http://127.0.0.1:1081"
+    http_ports = [1081, 1080, 7890, 20171, 20172, 10808, 10809]
+    socks_ports = [1080, 1081, 7891, 20173]
+    chosen = None
+    for p in http_ports:
+        if _port_open(p):
+            chosen = f"http://127.0.0.1:{p}"
+            print(f"[DEBUG] 找到 HTTP 代理端口: {p}")
+            break
+    if not chosen:
+        for p in socks_ports:
+            if _port_open(p):
+                chosen = f"socks5://127.0.0.1:{p}"
+                print(f"[DEBUG] 找到 SOCKS5 代理端口: {p}")
+                break
+    if chosen:
+        SOCKS5_URL = chosen
     else:
-        SOCKS5_URL = "socks5://127.0.0.1:1080"
+        print("[DEBUG] NODE_LINK 已设置但未找到可用代理端口，直连模式")
 
 DISCORD_URL = "https://discord.com/login"
 LOGIN_URL = "https://billing.kerit.cloud"
 MAIN_URL = "https://billing.kerit.cloud/free_panel"
-
-# ================= CF Turnstile 过盾（katabump 风格） =================
 
 _TURNSTILE_EXPAND_JS = """
 (function() {
@@ -230,8 +238,6 @@ def handle_turnstile(sb, max_attempts=6):
 
     print(f"  ❌ Turnstile {max_attempts} 轮均失败")
     return False
-
-# ================= Kerit 续期主类 =================
 
 class KeritCloudRenewal:
     def __init__(self):
@@ -434,11 +440,11 @@ class KeritCloudRenewal:
             return False
 
     def cloudflare_all_page(self, sb):
-        self.log("⏳ 等待 Cloudflare 验证通过（仿 katabump 方式）...")
+        self.log("⏳ 等待 Cloudflare 验证通过...")
         cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot",
                          "just a moment", "checking your browser", "performing security"]
         page_loaded = False
-        for i in range(30):
+        for i in range(45):
             try:
                 page_lower = sb.get_page_source().lower()
                 if not any(x in page_lower for x in cf_indicators):
@@ -458,11 +464,11 @@ class KeritCloudRenewal:
             self.log("✅ CF 挑战已通过，页面正常加载")
             return True
 
-        self.log("⚠️ 30秒等待超时，尝试 reconnect...")
+        self.log("⚠️ 45秒等待超时，尝试 reconnect...")
         try:
-            sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=45)
-            time.sleep(10)
-            for i in range(30):
+            sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=60)
+            time.sleep(15)
+            for i in range(45):
                 try:
                     page_lower = sb.get_page_source().lower()
                     if not any(x in page_lower for x in cf_indicators):
