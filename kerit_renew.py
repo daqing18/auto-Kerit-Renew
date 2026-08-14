@@ -29,9 +29,21 @@ TG_TOKEN = os.getenv("TG_TOKEN")  # tg通知token
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")  # tg通知chat_id
 
 # 自动挂载 sing-box 代理
+# 与 katabump 脚本保持一致：优先用 HTTP 代理端口 (1081)，CF 检测对 SOCKS5 更敏感
 SOCKS5_URL = os.getenv("PROXY_SERVER", "")
 if not SOCKS5_URL and os.getenv("NODE_LINK"):
-    SOCKS5_URL = "socks5://127.0.0.1:1080" # setup_proxy.sh 默认的本地 socks5 端口
+    import socket
+    def _port_open(port):
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=1)
+            s.close()
+            return True
+        except Exception:
+            return False
+    if _port_open(1081):
+        SOCKS5_URL = "http://127.0.0.1:1081"  # 与 katabump 一致
+    else:
+        SOCKS5_URL = "socks5://127.0.0.1:1080"  # setup_proxy.sh 默认的本地 socks5 端口
 
 # 目标 URL
 DISCORD_URL = "https://discord.com/login"
@@ -649,12 +661,8 @@ class KeritCloudRenewal:
         self.log(f"🎯 正在启动 Chrome 浏览器... (代理: {SOCKS5_URL if SOCKS5_URL else '未配置直连'})")
         
         with SB(
-            uc=True,            
-            test=True, 
-            headed=True,        
-            headless=False,     
-            xvfb=False,         
-            chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-position=0,0,--start-maximized",
+            uc=True,
+            headless=False,
             proxy=SOCKS5_URL if SOCKS5_URL else None
         ) as sb:
             try:
