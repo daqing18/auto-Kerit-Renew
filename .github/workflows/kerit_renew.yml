@@ -2,70 +2,88 @@ name: Kerit Renew
 
 on:
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: '0 */6 * * *'
   workflow_dispatch:
-
-env:
-  TZ: Asia/Shanghai
 
 jobs:
   renew:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
+
     steps:
+      - name: 设置时区
+        run: |
+          sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          echo "Asia/Shanghai" | sudo tee /etc/timezone
+
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: 安装依赖
         run: |
-          pip install seleniumbase
+          python -m pip install --upgrade pip
+          pip install seleniumbase requests
 
       - name: 安装 sing-box
         run: |
-          curl -sSfL https://sing-box.app/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://sing-box.app/install.sh | sh -s --
 
       - name: 生成 sing-box 配置
         env:
-          PROXY_STR: ${{ secrets.HY2_PROXY_URL }}
+          PROXY_STR: ${{ secrets.NODE_LINK }}
         run: |
           python generate_singbox_config.py
-          cat config.json
+          cat config.json | head -20
 
       - name: 启动 sing-box
         run: |
-          sing-box run -c config.json &
-          sleep 2
-          ss -tlnp | grep 8080
+          nohup sing-box run -c config.json > /tmp/sing-box.log 2>&1 &
+          sleep 3
+          sing-box version
+          cat /tmp/sing-box.log
 
       - name: 解析账号信息
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
         run: |
-          ACCOUNT=*** secrets.KERIT_ACCOUNT }}
-          export EMAIL="${ACCOUNT%%,*}"
-          export PASSWORD="${ACCOUNT#*,}"
-          echo "EMAIL=$EMAIL" >> $GITHUB_ENV
+          echo "EMAIL 已配置: ${{ secrets.EMAIL }}"
+          echo "PASSWORD 已配置: ${{ secrets.PASSWORD }}"
 
       - name: 解析 Telegram 配置
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          TG=${{ secrets.TG_BOT }}
-          export TG_CHAT_ID="${TG%%,*}"
-          export TG_TOKEN="${TG#*,}"
+          echo "TG_TOKEN 已配置: ${{ secrets.TG_TOKEN }}"
+          echo "TG_CHAT_ID 已配置: ${{ secrets.TG_CHAT_ID }}"
 
       - name: 安装 xvfb
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
 
       - name: 运行续期
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python kerit_renew.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python kerit_renew_cf_fixed.py
 
       - name: 上传截图
-        uses: actions/upload-artifact@v4
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: kerit-screenshots
-          path: artifacts/
-          retention-days: 7
+          path: |
+            *.png
+            *.html
