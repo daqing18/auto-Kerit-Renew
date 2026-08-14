@@ -89,15 +89,100 @@ def check_token(sb) -> bool:
         return False
 
 
+def diagnose_turnstile(sb, log_prefix=""):
+    """诊断 Turnstile 页面状态"""
+    try:
+        diag = sb.execute_script("""
+        (function(){
+            var result = {};
+            // 检查 cf-turnstile-response input
+            var ts_input = document.querySelector('input[name="cf-turnstile-response"]');
+            result.has_turnstile_input = !!ts_input;
+            if (ts_input) {
+                result.turnstile_value_len = (ts_input.value || '').length;
+            }
+            // 检查所有 iframe
+            var frames = document.querySelectorAll('iframe');
+            result.frame_count = frames.length;
+            result.cf_frames = [];
+            frames.forEach(function(f, i) {
+                var src = f.src || '';
+                if (src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
+                    var rect = f.getBoundingClientRect();
+                    result.cf_frames.push({
+                        index: i,
+                        src: src.substring(0, 120),
+                        visible: f.offsetParent !== null,
+                        rect: {w: Math.round(rect.width), h: Math.round(rect.height),
+                               x: Math.round(rect.x), y: Math.round(rect.y)},
+                        overflow: window.getComputedStyle(f.parentElement).overflow
+                    });
+                }
+            });
+            // 页面关键文本
+            var body = document.body ? document.body.innerText.substring(0, 500) : '';
+            result.body_text = body;
+            result.title = document.title;
+            result.url = window.location.href;
+            return JSON.stringify(result);
+        })()
+        """)
+        print(f"{log_prefix}📊 Turnstile 诊断: {diag}")
+        return diag
+    except Exception as e:
+        print(f"{log_prefix}⚠️ 诊断失败: {e}")
+        return ""
+
+
+def click_turnstile_js(sb) -> bool:
+    """尝试用 JS 直接触发 Turnstile 验证"""
+    try:
+        result = sb.execute_script("""
+        (function(){
+            var frames = document.querySelectorAll('iframe');
+            for (var i = 0; i < frames.length; i++) {
+                var src = frames[i].src || '';
+                if (src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
+                    // 方法1: 直接点击 iframe
+                    try { frames[i].click(); } catch(e) {}
+                    // 方法2: dispatchEvent
+                    try {
+                        var evt = new MouseEvent('click', {bubbles: true, cancelable: true, view: window});
+                        frames[i].dispatchEvent(evt);
+                    } catch(e) {}
+                    return 'clicked_iframe_' + i;
+                }
+            }
+            // 方法3: 在 iframe 内找 checkbox
+            var ts_input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (ts_input) {
+                // 触发 Turnstile 的隐式验证
+                ts_input.dispatchEvent(new Event('focus', {bubbles: true}));
+                ts_input.dispatchEvent(new Event('click', {bubbles: true}));
+                return 'triggered_input';
+            }
+            return 'no_turnstile_found';
+        })()
+        """)
+        print(f"   JS 点击结果: {result}")
+        return True
+    except Exception as e:
+        print(f"   JS 点击异常: {e}")
+        return False
+
+
 def handle_turnstile(sb, max_attempts=6) -> bool:
     """
-    katabump 风格 Turnstile 处理：
-    1. 展开 iframe（防止 overflow:hidden 裁剪）
-    2. 检查是否已静默通过
-    3. 多次调用 uc_gui_click_captcha()，每次间隔 0.5s 轮询验证
+    增强版 Turnstile 处理（katabump 风格 + 多策略 fallback）：
+    1. 诊断页面状态
+    2. 展开 iframe
+    3. 多策略点击：uc_gui_click_captcha → JS 点击 → iframe 切换点击
     """
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
+
+    # 诊断：查看 Turnstile 状态
+    diagnose_turnstile(sb, "   ")
 
     # 检查是否已静默通过
     if check_token(sb):
@@ -112,28 +197,75 @@ def handle_turnstile(sb, max_attempts=6) -> bool:
             pass
         time.sleep(0.5)
 
-    # 使用 uc_gui_click_captcha 多次尝试，每轮轮询 0.5s 检测
+    # ===== 多策略尝试 =====
     for attempt in range(max_attempts):
         if check_token(sb):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试前已通过）")
             return True
 
-        print(f"🖱️ 第 {attempt + 1}/{max_attempts} 次调用 uc_gui_click_captcha...")
+        print(f"🔄 第 {attempt + 1}/{max_attempts} 轮尝试...")
+
+        # 策略1: seleniumbase uc_gui_click_captcha
+        print(f"   🖱️ 策略1: uc_gui_click_captcha...")
         try:
             sb.uc_gui_click_captcha()
+            for _ in range(8):
+                time.sleep(0.5)
+                if check_token(sb):
+                    print(f"✅ Turnstile 通过（策略1，第 {attempt + 1} 次）")
+                    return True
         except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
+            print(f"   ⚠️ 策略1 异常: {e}")
 
-        # 等待验证结果（最多 8 秒，每 0.5s 检测）
-        for _ in range(16):
+        # 策略2: JS 直接触发 iframe 点击
+        print(f"   🖱️ 策略2: JS 点击 iframe...")
+        click_turnstile_js(sb)
+        for _ in range(8):
             time.sleep(0.5)
             if check_token(sb):
-                print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
+                print(f"✅ Turnstile 通过（策略2，第 {attempt + 1} 次）")
                 return True
 
-        print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
+        # 策略3: 切换 iframe 再点击 checkbox
+        print(f"   🖱️ 策略3: iframe 切换点击...")
+        try:
+            frames = sb.find_elements("iframe")
+            for frame in frames:
+                try:
+                    src = frame.get_attribute("src") or ""
+                    if "challenges.cloudflare.com" in src or "turnstile" in src:
+                        sb.driver.switch_to.frame(frame)
+                        try:
+                            cb = sb.find_element("input[type='checkbox']")
+                            cb.click()
+                            print(f"   ✅ iframe 内 checkbox 点击成功")
+                        except:
+                            pass
+                        sb.driver.switch_to.default_content()
+                        break
+                except:
+                    try:
+                        sb.driver.switch_to.default_content()
+                    except:
+                        pass
+        except Exception as e:
+            print(f"   ⚠️ 策略3 异常: {e}")
 
-    print(f"  ❌ Turnstile {max_attempts} 次均失败")
+        for _ in range(8):
+            time.sleep(0.5)
+            if check_token(sb):
+                print(f"✅ Turnstile 通过（策略3，第 {attempt + 1} 次）")
+                return True
+
+        print(f"⚠️ 第 {attempt + 1} 轮所有策略均未通过，重试...")
+
+    print(f"  ❌ Turnstile {max_attempts} 轮均失败")
+    # 保存诊断截图
+    try:
+        sb.save_screenshot("turnstile_failed.png")
+        print("  📸 已保存诊断截图: turnstile_failed.png")
+    except:
+        pass
     return False
 
 
@@ -377,29 +509,45 @@ class KeritCloudRenewal:
             return False
 
     # ============================================================
-    # 过盾方法（katabump 风格替换）
+    # 过盾方法（增强版 katabump 风格 + 多策略 + 诊断）
     # ============================================================
     def cloudflare_all_page(self, sb):
         """
-        替换为 katabump 风格的 Turnstile 处理：
-        展开 iframe → uc_gui_click_captcha × 6 次 → 0.5s 轮询检测
+        增强版 CF 过盾：
+        1. 诊断当前页面状态（截图+源码）
+        2. 用 handle_turnstile 处理 Turnstile（多策略）
+        3. 失败后 reconnect 再试
         """
-        self.log("⏳ 处理 Cloudflare 挑战（katabump 风格）...")
+        self.log("⏳ 处理 Cloudflare 挑战（增强版）...")
         cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot",
                          "just a moment", "checking your browser", "performing security"]
 
         # 先检查是否已经过了
         page_lower = sb.get_page_source().lower()
         if not any(x in page_lower for x in cf_indicators):
-            self.log("✅ Cloudflare 验证已通过")
+            self.log("✅ Cloudflare 验证已通过（无 CF 关键词）")
             return True
 
-        # 使用 katabump 风格处理 Turnstile
+        # 诊断截图
+        try:
+            sb.save_screenshot(f"{self.screenshot_dir}/cf_diagnostic.png")
+            self.log(f"📸 CF 诊断截图已保存")
+        except:
+            pass
+
+        # 输出当前页面标题和 URL
+        try:
+            self.log(f"📄 当前页面标题: {sb.get_title()}")
+            self.log(f"🔗 当前 URL: {sb.get_current_url()}")
+        except:
+            pass
+
+        # 使用增强版 handle_turnstile 处理
         if handle_turnstile(sb, max_attempts=6):
             self.log("✅ Cloudflare 验证通过")
             return True
 
-        # 如果 katabump 方式失败，尝试 reconnect 刷新
+        # 如果失败，尝试 reconnect 刷新
         for attempt in range(3):
             self.log(f"🔄 reconnect 尝试 {attempt+1}/3...")
             try:
