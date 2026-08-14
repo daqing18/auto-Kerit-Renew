@@ -144,7 +144,6 @@ class KeritCloudRenewal:
             try:
                 url = sb.get_current_url()
                 self.log(f"当前URL:{url}")
-                # 修复误判：如果在根目录登录页，不能算作授权完成
                 if "kerit.cloud" in url and "login" not in url.lower() and url.strip("/") != "https://billing.kerit.cloud":
                     self.log("✅ OAuth完成 (已成功进入面板后台)")
                     return True
@@ -157,7 +156,6 @@ class KeritCloudRenewal:
     def click_discord_login(self, sb):
         try:
             self.log("🔍 等待 Discord 登录按钮...")
-            # 扩大选择器范围，适配前端可能的变化
             selectors = [
                 'a[href="/auth/discord"]',
                 '//button[contains(., "Continue with Discord")]',
@@ -176,7 +174,6 @@ class KeritCloudRenewal:
                     continue
             
             if not clicked:
-                # 尝试用 JS 点击包含 discord 字符的按钮
                 sb.execute_script("""
                     let btns = document.querySelectorAll('button, a');
                     for (let b of btns) {
@@ -279,28 +276,76 @@ class KeritCloudRenewal:
             return False
 
     def cloudflare_all_page(self, sb):
+        """区分 JS Challenge 和 Turnstile，分别处理"""
         self.log("⏳ 处理 Cloudflare 挑战...")
-        cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment", "checking your browser"]
+        cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot",
+                         "just a moment", "checking your browser", "performing security"]
         
-        for _ in range(5): # 最多尝试5次，总计约 60 秒
+        # 先检查当前页面状态
+        for _ in range(3):
             page_lower = sb.get_page_source().lower()
             if not any(x in page_lower for x in cf_indicators):
-                self.log("✅ Cloudflare 验证已通过 (或未遇到挑战)")
+                self.log("✅ Cloudflare 验证已通过")
                 return True
+            time.sleep(3)
+        
+        # 判断是 Turnstile 还是 JS Challenge
+        page_lower = sb.get_page_source().lower()
+        has_turnstile = "cf-chl-widget" in page_lower or "turnstile" in page_lower or "challenge-platform" in page_lower
+        
+        if has_turnstile:
+            self.log("🛡️ 检测到 Turnstile 验证（复选框），尝试点击...")
+            for _ in range(5):
+                try:
+                    sb.uc_gui_click_captcha()
+                except:
+                    pass
+                time.sleep(12)
+                page_lower = sb.get_page_source().lower()
+                if not any(x in page_lower for x in cf_indicators):
+                    self.log("✅ Turnstile 通过")
+                    return True
+            self.log("❌ Turnstile 5次尝试失败")
+            return False
+        else:
+            self.log("🛡️ 检测到 JS Challenge（自动检测），用 reconnect 策略通过...")
+            for attempt in range(6):
+                self.log(f"🔄 JS Challenge reconnect {attempt+1}/6...")
+                try:
+                    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=30)
+                    # 等待 JS Challenge 自动通过
+                    for w in range(15):
+                        time.sleep(2)
+                        page_lower = sb.get_page_source().lower()
+                        if not any(x in page_lower for x in cf_indicators):
+                            self.log(f"✅ JS Challenge 通过 (第{attempt+1}次 reconnect)")
+                            return True
+                        # 如果出现了 Turnstile 复选框，点它
+                        if "cf-chl-widget" in page_lower or "turnstile" in page_lower:
+                            try:
+                                sb.uc_gui_click_captcha()
+                            except:
+                                pass
+                except Exception as e:
+                    self.log(f"⚠️ reconnect 异常: {e}")
+                    time.sleep(3)
+                    continue
             
-            self.log("🛡️ 检测到 CF 盾，尝试处理...")
+            self.log("❌ JS Challenge 6次 reconnect 失败")
+            # 最后尝试直连模式（无代理）
+            self.log("🔄 尝试不带代理直连...")
             try:
-                sb.uc_gui_click_captcha()
+                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=30)
+                time.sleep(30)
+                page_lower = sb.get_page_source().lower()
+                if not any(x in page_lower for x in cf_indicators):
+                    self.log("✅ 直连通过 CF 验证")
+                    return True
             except:
                 pass
-            time.sleep(12)
-        
-        # 最后再检查一次
-        page_lower = sb.get_page_source().lower()
-        if any(x in page_lower for x in cf_indicators):
+            
             self.log("❌ Cloudflare 验证超时失败")
             return False
-        return True
 
     def check_renewal_status(self, sb):
         try:
@@ -392,7 +437,7 @@ class KeritCloudRenewal:
                 
                 # 如果 CF 没过，直接停止，不要盲目往下执行
                 if not self.cloudflare_all_page(sb):
-                    self.log("❌ 无法绕过 Cloudflare，停止续期流程。大概率是代理节点IP质量差被拦截。")
+                    self.log("❌ 无法绕过 Cloudflare，停止续期流程。")
                     sb.save_screenshot(f"{self.screenshot_dir}/cf_failed.png")
                     self.send_telegram_notify("❌ Cloudflare 拦截，续期失败", f"{self.screenshot_dir}/cf_failed.png")
                     return
