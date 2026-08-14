@@ -509,60 +509,75 @@ class KeritCloudRenewal:
             return False
 
     # ============================================================
-    # 过盾方法（增强版 katabump 风格 + 多策略 + 诊断）
+    # 过盾方法（完全按 katabump 脚本的方式：等待页面加载，不盲目点验证）
     # ============================================================
     def cloudflare_all_page(self, sb):
         """
-        增强版 CF 过盾：
-        1. 诊断当前页面状态（截图+源码）
-        2. 用 handle_turnstile 处理 Turnstile（多策略）
-        3. 失败后 reconnect 再试
+        仿 katabump 脚本的过盾方式：
+        1. uc_open_with_reconnect 已经处理了 JS Challenge
+        2. 等待页面上 Discord 登录按钮出现（最多等 30 秒）
+        3. 如果页面正常加载，说明 CF 已过
+        4. 如果页面还是 Just a moment，尝试 reconnect 再等
         """
-        self.log("⏳ 处理 Cloudflare 挑战（增强版）...")
+        self.log("⏳ 等待 Cloudflare 验证通过（仿 katabump 方式）...")
+
+        # 先检查当前页面标题
+        try:
+            title = sb.get_title() or ""
+            url = sb.get_current_url() or ""
+            self.log(f"📄 当前标题: {title}, URL: {url}")
+        except:
+            pass
+
+        # 等待 Discord 登录按钮或页面非 CF 内容出现（最多 30 秒）
         cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot",
                          "just a moment", "checking your browser", "performing security"]
+        page_loaded = False
 
-        # 先检查是否已经过了
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in cf_indicators):
-            self.log("✅ Cloudflare 验证已通过（无 CF 关键词）")
-            return True
-
-        # 诊断截图
-        try:
-            sb.save_screenshot(f"{self.screenshot_dir}/cf_diagnostic.png")
-            self.log(f"📸 CF 诊断截图已保存")
-        except:
-            pass
-
-        # 输出当前页面标题和 URL
-        try:
-            self.log(f"📄 当前页面标题: {sb.get_title()}")
-            self.log(f"🔗 当前 URL: {sb.get_current_url()}")
-        except:
-            pass
-
-        # 使用增强版 handle_turnstile 处理
-        if handle_turnstile(sb, max_attempts=6):
-            self.log("✅ Cloudflare 验证通过")
-            return True
-
-        # 如果失败，尝试 reconnect 刷新
-        for attempt in range(3):
-            self.log(f"🔄 reconnect 尝试 {attempt+1}/3...")
+        for i in range(30):
             try:
-                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=30)
-                time.sleep(20)
                 page_lower = sb.get_page_source().lower()
-                if not any(x in page_lower for x in cf_indicators):
-                    self.log("✅ reconnect 通过 CF")
-                    return True
-                # reconnect 后可能还有 Turnstile，再试一次
-                if handle_turnstile(sb, max_attempts=4):
-                    self.log("✅ reconnect 后 Turnstile 通过")
-                    return True
-            except:
-                time.sleep(3)
+                # 检查是否还有 CF 关键词
+                still_cf = any(x in page_lower for x in cf_indicators)
+                if not still_cf:
+                    self.log(f"✅ Cloudflare 验证已通过（{i+1}s）")
+                    page_loaded = True
+                    break
+
+                # 同时检查页面上是否有 Discord 按钮（说明页面已加载）
+                try:
+                    if sb.is_element_visible('a[href="/auth/discord"]'):
+                        self.log(f"✅ 页面已加载，Discord 按钮可见（{i+1}s）")
+                        page_loaded = True
+                        break
+                except:
+                    pass
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if page_loaded:
+            self.log("✅ CF 挑战已通过，页面正常加载")
+            return True
+
+        # 如果等待超时，尝试 reconnect
+        self.log("⚠️ 30秒等待超时，尝试 reconnect...")
+        try:
+            sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=45)
+            time.sleep(10)
+
+            # 再等一次
+            for i in range(30):
+                try:
+                    page_lower = sb.get_page_source().lower()
+                    if not any(x in page_lower for x in cf_indicators):
+                        self.log(f"✅ reconnect 后 CF 通过（{i+1}s）")
+                        return True
+                except:
+                    pass
+                time.sleep(1)
+        except Exception as e:
+            self.log(f"⚠️ reconnect 异常: {e}")
 
         self.log("❌ Cloudflare 验证超时失败")
         return False
@@ -652,10 +667,10 @@ class KeritCloudRenewal:
                 time.sleep(10)
 
                 self.log("📂 进入登录页面")
-                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=25)
-                time.sleep(10)
+                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8)
+                time.sleep(6)
                 
-                # 如果 CF 没过，直接停止，不要盲目往下执行
+                # 仿 katabump 脚本：等待 CF 通过，检查页面是否加载
                 if not self.cloudflare_all_page(sb):
                     self.log("❌ 无法绕过 Cloudflare，停止续期流程。大概率是代理节点IP质量差被拦截。")
                     sb.save_screenshot(f"{self.screenshot_dir}/cf_failed.png")
