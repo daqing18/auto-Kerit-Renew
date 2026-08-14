@@ -1,14 +1,20 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Kerit 免费服务器自动续期脚本
+使用 Discord 登录 + katabump 风格过盾逻辑
+变量：EMAIL, PASSWORD, TG_TOKEN, TG_CHAT_ID, NODE_LINK
+"""
 import time
 import os
 import json
 import re
 import random
-import socket
 import requests
 
+# 智能环境配置
 if "DISPLAY" not in os.environ:
     os.environ["DISPLAY"] = ":1"
-
 if "XAUTHORITY" not in os.environ:
     if os.path.exists("/home/headless/.Xauthority"):
         os.environ["XAUTHORITY"] = "/home/headless/.Xauthority"
@@ -20,33 +26,33 @@ from seleniumbase import SB
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 
-EMAIL = os.getenv("EMAIL")
-PASSWORD = os.getenv("PASSWORD")
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+# ================= 配置区域 =================
+EMAIL = os.getenv("EMAIL")         # optiklink/discord 邮箱
+PASSWORD = os.getenv("PASSWORD")   # 密码
+TG_TOKEN = os.getenv("TG_TOKEN")   # TG Bot Token
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")  # TG 聊天ID
 
-PROXY_SERVER = os.getenv("PROXY_SERVER", "")
-NODE_LINK = os.getenv("NODE_LINK", "")
-
-def _port_open(port):
-    try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=1)
-        s.close()
-        return True
-    except Exception:
-        return False
-
-if not PROXY_SERVER and NODE_LINK:
-    if _port_open(8080):
-        PROXY_SERVER = "http://127.0.0.1:8080"
-    elif _port_open(1081):
-        PROXY_SERVER = "http://127.0.0.1:1081"
+# 代理：NODE_LINK 不为空则自动检测端口，优先 1081(HTTP)，回退 1080(SOCKS5)
+SOCKS5_URL = os.getenv("PROXY_SERVER", "")
+if not SOCKS5_URL and os.getenv("NODE_LINK"):
+    import socket
+    def _port_open(port):
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=1)
+            s.close()
+            return True
+        except Exception:
+            return False
+    if _port_open(1081):
+        SOCKS5_URL = "http://127.0.0.1:1081"
     else:
-        PROXY_SERVER = "socks5://127.0.0.1:1080"
+        SOCKS5_URL = "socks5://127.0.0.1:1080"
 
 DISCORD_URL = "https://discord.com/login"
 LOGIN_URL = "https://billing.kerit.cloud"
 MAIN_URL = "https://billing.kerit.cloud/free_panel"
+
+# ================= CF Turnstile 过盾（katabump 风格） =================
 
 _TURNSTILE_EXPAND_JS = """
 (function() {
@@ -98,7 +104,7 @@ def diagnose_turnstile(sb, log_prefix=""):
             var result = {};
             var ts_input = document.querySelector('input[name="cf-turnstile-response"]');
             result.has_turnstile_input = !!ts_input;
-            if (ts_input) { result.turnstile_value_len = (ts_input.value || '').length; }
+            if (ts_input) result.turnstile_value_len = (ts_input.value || '').length;
             var frames = document.querySelectorAll('iframe');
             result.frame_count = frames.length;
             result.cf_frames = [];
@@ -106,10 +112,13 @@ def diagnose_turnstile(sb, log_prefix=""):
                 var src = f.src || '';
                 if (src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
                     var rect = f.getBoundingClientRect();
-                    result.cf_frames.push({index:i, src:src.substring(0,120),
-                        visible:f.offsetParent !== null,
-                        rect:{w:Math.round(rect.width),h:Math.round(rect.height),x:Math.round(rect.x),y:Math.round(rect.y)},
-                        overflow:window.getComputedStyle(f.parentElement).overflow});
+                    result.cf_frames.push({
+                        index: i, src: src.substring(0, 120),
+                        visible: f.offsetParent !== null,
+                        rect: {w: Math.round(rect.width), h: Math.round(rect.height),
+                               x: Math.round(rect.x), y: Math.round(rect.y)},
+                        overflow: window.getComputedStyle(f.parentElement).overflow
+                    });
                 }
             });
             var body = document.body ? document.body.innerText.substring(0, 500) : '';
@@ -135,7 +144,7 @@ def click_turnstile_js(sb):
                 if (src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
                     try { frames[i].click(); } catch(e) {}
                     try {
-                        var evt = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
+                        var evt = new MouseEvent('click', {bubbles: true, cancelable: true, view: window});
                         frames[i].dispatchEvent(evt);
                     } catch(e) {}
                     return 'clicked_iframe_' + i;
@@ -143,8 +152,8 @@ def click_turnstile_js(sb):
             }
             var ts_input = document.querySelector('input[name="cf-turnstile-response"]');
             if (ts_input) {
-                ts_input.dispatchEvent(new Event('focus', {bubbles:true}));
-                ts_input.dispatchEvent(new Event('click', {bubbles:true}));
+                ts_input.dispatchEvent(new Event('focus', {bubbles: true}));
+                ts_input.dispatchEvent(new Event('click', {bubbles: true}));
                 return 'triggered_input';
             }
             return 'no_turnstile_found';
@@ -164,17 +173,17 @@ def handle_turnstile(sb, max_attempts=6):
         print("✅ 已静默通过")
         return True
     for _ in range(3):
-        try:
-            sb.execute_script(_TURNSTILE_EXPAND_JS)
-        except Exception:
-            pass
+        try: sb.execute_script(_TURNSTILE_EXPAND_JS)
+        except Exception: pass
         time.sleep(0.5)
-    for attempt in range(6):
+
+    for attempt in range(max_attempts):
         if check_token(sb):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试前已通过）")
             return True
-        print(f"🔄 第 {attempt + 1}/6 轮尝试...")
-        print("   🖱️ 策略1: uc_gui_click_captcha...")
+        print(f"🔄 第 {attempt + 1}/{max_attempts} 轮尝试...")
+
+        print(f"   🖱️ 策略1: uc_gui_click_captcha...")
         try:
             sb.uc_gui_click_captcha()
             for _ in range(8):
@@ -184,14 +193,16 @@ def handle_turnstile(sb, max_attempts=6):
                     return True
         except Exception as e:
             print(f"   ⚠️ 策略1 异常: {e}")
-        print("   🖱️ 策略2: JS 点击 iframe...")
+
+        print(f"   🖱️ 策略2: JS 点击 iframe...")
         click_turnstile_js(sb)
         for _ in range(8):
             time.sleep(0.5)
             if check_token(sb):
                 print(f"✅ Turnstile 通过（策略2，第 {attempt + 1} 次）")
                 return True
-        print("   🖱️ 策略3: iframe 切换点击...")
+
+        print(f"   🖱️ 策略3: iframe 切换点击...")
         try:
             frames = sb.find_elements("iframe")
             for frame in frames:
@@ -202,16 +213,12 @@ def handle_turnstile(sb, max_attempts=6):
                         try:
                             cb = sb.find_element("input[type='checkbox']")
                             cb.click()
-                            print("   ✅ iframe 内 checkbox 点击成功")
-                        except:
-                            pass
+                        except: pass
                         sb.driver.switch_to.default_content()
                         break
                 except:
-                    try:
-                        sb.driver.switch_to.default_content()
-                    except:
-                        pass
+                    try: sb.driver.switch_to.default_content()
+                    except: pass
         except Exception as e:
             print(f"   ⚠️ 策略3 异常: {e}")
         for _ in range(8):
@@ -220,13 +227,11 @@ def handle_turnstile(sb, max_attempts=6):
                 print(f"✅ Turnstile 通过（策略3，第 {attempt + 1} 次）")
                 return True
         print(f"⚠️ 第 {attempt + 1} 轮所有策略均未通过，重试...")
-    print("  ❌ Turnstile 6 轮均失败")
-    try:
-        sb.save_screenshot("turnstile_failed.png")
-        print("  📸 已保存诊断截图: turnstile_failed.png")
-    except:
-        pass
+
+    print(f"  ❌ Turnstile {max_attempts} 轮均失败")
     return False
+
+# ================= Kerit 续期主类 =================
 
 class KeritCloudRenewal:
     def __init__(self):
@@ -245,7 +250,7 @@ class KeritCloudRenewal:
     def move_mouse_human(self, sb):
         try:
             for _ in range(3):
-                sb.slow_click(f"body", force=True)
+                sb.slow_click("body", force=True)
                 time.sleep(random.uniform(0.5, 1.2))
         except: pass
 
@@ -284,14 +289,15 @@ class KeritCloudRenewal:
                 for btn in buttons:
                     try:
                         text = (btn.text or "").strip()
-                        self.log(f"按钮: {repr(text)}")
                         if "继续滚动" in text:
                             self.log("🟡 发现继续滚动按钮")
                             sb.execute_script("""
                                 let els=document.querySelectorAll('*');
                                 for(let el of els){
                                     try{
-                                        if(el.scrollHeight>el.clientHeight){ el.scrollTop=el.scrollHeight; }
+                                        if(el.scrollHeight>el.clientHeight){
+                                            el.scrollTop=el.scrollHeight;
+                                        }
                                     }catch(e){}
                                 }
                             """)
@@ -300,7 +306,7 @@ class KeritCloudRenewal:
                             self.log("✅ 已点击继续滚动")
                             time.sleep(5)
                             break
-                        if "授权" in text or text == "Authorize" or text == "Authorise":
+                        if "授权" in text or text in ("Authorize", "Authorise"):
                             self.log("🟢 找到授权按钮")
                             sb.execute_script('document.querySelectorAll("button")[1].click();')
                             self.log("✅ OAuth授权点击完成")
@@ -330,21 +336,26 @@ class KeritCloudRenewal:
                 '//span[contains(., "Continue with Discord")]',
                 '//a[contains(., "Discord")]'
             ]
+            clicked = False
             for sel in selectors:
                 try:
                     if sb.is_element_visible(sel):
                         sb.click(sel)
-                        self.log(f"✅ Discord 登录按钮点击成功 ({sel})")
-                        return True
-                except:
-                    continue
-            sb.execute_script("""
-                let btns = document.querySelectorAll('button, a');
-                for (let b of btns) {
-                    if ((b.innerText || '').toLowerCase().includes('discord')) { b.click(); return; }
-                }
-            """)
-            self.log("✅ 尝试使用 JS 强制点击 Discord 按钮")
+                        clicked = True
+                        self.log(f"✅ Discord 按钮点击成功 ({sel})")
+                        break
+                except: continue
+            if not clicked:
+                sb.execute_script("""
+                    let btns = document.querySelectorAll('button, a');
+                    for (let b of btns) {
+                        if ((b.innerText || '').toLowerCase().includes('discord')) {
+                            b.click();
+                            return;
+                        }
+                    }
+                """)
+                self.log("✅ JS 强制点击 Discord 按钮")
             return True
         except Exception as e:
             self.log(f"❌ Discord 登录点击失败: {e}")
@@ -363,7 +374,8 @@ class KeritCloudRenewal:
                 for(let i=0;i<6;i++){
                     if(target.tagName=="A" || target.tagName=="BUTTON" || typeof target.onclick=="function"){
                         if(target.tagName=="A"){ target.removeAttribute("target"); }
-                        target.click(); return;
+                        target.click();
+                        return;
                     }
                     target=target.parentElement;
                     if(!target) return;
@@ -376,9 +388,10 @@ class KeritCloudRenewal:
 
             handles = sb.driver.window_handles
             self.log(f"🔎 当前窗口数量: {len(handles)}")
-            for i,h in enumerate(handles):
+            for i, h in enumerate(handles):
                 self.log(f"🔎 Window {i}: {h}")
 
+            self.log("🔎 检查 Turnstile 状态")
             state = sb.execute_script("""
             return {
                 token: typeof renewalState !== "undefined" ? renewalState.turnstileToken : "NO",
@@ -386,29 +399,22 @@ class KeritCloudRenewal:
             };
             """)
             self.log(f"🔎 Turnstile状态: {state}")
-            self.log("⏳等待 Complete Renewal 激活...")
+            self.log("⏳ 等待 Complete Renewal 激活...")
             time.sleep(3)
 
             self.log("🔍 查找 Complete Renewal 按钮...")
             renew_btn = sb.find_element("#renewBtn")
             self.log("✅ 找到 Complete Renewal")
-
             sb.execute_script("""
                 arguments[0].scrollIntoView({block:'center'});
                 arguments[0].focus();
             """, renew_btn)
             time.sleep(2)
-
-            active = sb.execute_script("""
-            let el=document.activeElement;
-            return {tag:el.tagName, id:el.id, text:el.innerText, html:el.outerHTML.substring(0,300)};
-            """)
-            self.log(f"🔎 当前焦点: {active}")
-            time.sleep(2)
-
             self.log("↩️ 发送 ENTER")
             sb.driver.switch_to.active_element.send_keys(Keys.ENTER)
+            self.log("✅ ENTER发送完成")
             time.sleep(5)
+
             renew_result = sb.execute_script("""
             return {
                 success: document.body.innerText.includes("Server renewed successfully"),
@@ -422,7 +428,6 @@ class KeritCloudRenewal:
             if renew_result["error"]:
                 self.log("⚠️ Cannot exceed 7 days validity")
                 return False
-            self.log("⚠️ 未检测到续期结果")
             return False
         except Exception as e:
             self.log(f"❌ Renewal流程失败: {e}")
@@ -430,12 +435,6 @@ class KeritCloudRenewal:
 
     def cloudflare_all_page(self, sb):
         self.log("⏳ 等待 Cloudflare 验证通过（仿 katabump 方式）...")
-        try:
-            title = sb.get_title() or ""
-            url = sb.get_current_url() or ""
-            self.log(f"📄 当前标题: {title}, URL: {url}")
-        except:
-            pass
         cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot",
                          "just a moment", "checking your browser", "performing security"]
         page_loaded = False
@@ -451,14 +450,14 @@ class KeritCloudRenewal:
                         self.log(f"✅ 页面已加载，Discord 按钮可见（{i+1}s）")
                         page_loaded = True
                         break
-                except:
-                    pass
-            except Exception:
-                pass
+                except: pass
+            except Exception: pass
             time.sleep(1)
+
         if page_loaded:
             self.log("✅ CF 挑战已通过，页面正常加载")
             return True
+
         self.log("⚠️ 30秒等待超时，尝试 reconnect...")
         try:
             sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=45)
@@ -469,8 +468,7 @@ class KeritCloudRenewal:
                     if not any(x in page_lower for x in cf_indicators):
                         self.log(f"✅ reconnect 后 CF 通过（{i+1}s）")
                         return True
-                except:
-                    pass
+                except: pass
                 time.sleep(1)
         except Exception as e:
             self.log(f"⚠️ reconnect 异常: {e}")
@@ -509,6 +507,7 @@ class KeritCloudRenewal:
             if not status:
                 self.log("⚠️ 仍未获取状态，默认继续续期")
                 return True
+
             status_lower = status.lower()
             if "ready to renew" in status_lower:
                 self.log("✅ 当前可以续期")
@@ -526,16 +525,24 @@ class KeritCloudRenewal:
 
     def run(self):
         self.log("=" * 40)
-        self.log("🚀 Kerit.Cloud - Renew流程 (GitHub Actions 版)")
+        self.log("🚀 Kerit.Cloud - Renew流程")
         self.log("=" * 40)
+
         if not EMAIL or not PASSWORD:
-            self.log("❌ 严重错误: 未检测到 EMAIL 或 PASSWORD 环境变量")
+            self.log("❌ 未检测到 EMAIL 或 PASSWORD 环境变量！")
             return
-        self.log(f"🎯 正在启动 Chrome 浏览器... (代理: {PROXY_SERVER if PROXY_SERVER else '未配置直连'})")
-        with SB(uc=True, headless=False, proxy=PROXY_SERVER if PROXY_SERVER else None) as sb:
+
+        self.log(f"🎯 启动 Chrome... (代理: {SOCKS5_URL or '未配置直连'})")
+
+        with SB(
+            uc=True,
+            headless=False,
+            proxy=SOCKS5_URL if SOCKS5_URL else None
+        ) as sb:
             try:
                 self.log("✅ 浏览器已启动！")
-                self.log("🌍 正在检测出口 IP...")
+
+                self.log("🌍 检测出口 IP...")
                 try:
                     sb.open("https://api.ipify.org?format=json")
                     ip_val = json.loads(re.search(r'\{.*\}', sb.get_text("body")).group(0)).get('ip', 'Unknown')
@@ -543,25 +550,30 @@ class KeritCloudRenewal:
                     self.log(f"✅ 当前出口 IP: {parts[0]}.{parts[1]}.***.{parts[-1]}")
                 except:
                     self.log("⚠️ IP 检测跳过...")
-                self.log("🔗 访问Discord登录页...")
+
+                self.log("🔗 访问 Discord 登录页...")
                 sb.uc_open_with_reconnect(DISCORD_URL, reconnect_time=25)
                 time.sleep(5)
                 self.discord_login(sb, EMAIL, PASSWORD)
                 self.log("✅ 登录Discord成功")
                 time.sleep(10)
+
                 self.log("📂 进入登录页面")
                 sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8)
                 time.sleep(6)
+
                 if not self.cloudflare_all_page(sb):
                     self.log("❌ 无法绕过 Cloudflare")
                     sb.save_screenshot(f"{self.screenshot_dir}/cf_failed.png")
                     self.send_telegram_notify("❌ Cloudflare 拦截，续期失败", f"{self.screenshot_dir}/cf_failed.png")
                     return
+
                 self.log("📂 授权登录页面")
                 self.click_discord_login(sb)
                 time.sleep(15)
                 self.oauth_debug(sb)
                 time.sleep(15)
+
                 self.log("📂 点击进入续期页面")
                 sb.uc_open_with_reconnect(MAIN_URL, reconnect_time=25)
                 try:
@@ -569,20 +581,23 @@ class KeritCloudRenewal:
                     self.log("✅ 续期状态组件加载完成")
                 except:
                     self.log("⚠️ 未检测到 renewal-status-text")
+
                 if not self.check_renewal_status(sb):
-                    self.log("✅冷却中,无需续期")
+                    self.log("✅ 冷却中,无需续期")
                     final_screenshot = f"{self.screenshot_dir}/final.png"
                     sb.save_screenshot(final_screenshot)
                     mask_mail = EMAIL[:3] + "***" + EMAIL[EMAIL.find("@"):]
-                    self.send_telegram_notify(f"🎉Kerit.Cloud\n✅账号：[{mask_mail}] 冷却中,无需续期", final_screenshot)
+                    self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{mask_mail}] 冷却中,无需续期", final_screenshot)
                     return
+
                 self.log("✅ 点击Renew按钮")
                 sb.execute_script("""
                 let btn = document.querySelector("#renewServerBtn");
-                if (!btn) { throw new Error("renewServerBtn not found"); }
+                if (!btn) throw new Error("renewServerBtn not found");
                 btn.click();
                 """)
                 time.sleep(10)
+
                 self.log("✅ 点击sponsor按钮后并点击续期")
                 self.click_sponsor_and_complete_renew(sb)
                 time.sleep(3)
@@ -591,6 +606,7 @@ class KeritCloudRenewal:
                 sb.save_screenshot(final_screenshot)
                 mask_mail = EMAIL[:3] + "***" + EMAIL[EMAIL.find("@"):]
                 self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{mask_mail}]\n续期流程完毕", final_screenshot)
+
             except Exception as e:
                 self.log(f"❌ 运行异常: {e}")
                 import traceback
