@@ -24,8 +24,9 @@ PASSWORD = os.getenv("PASSWORD")
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
+# ===== 代理配置：依次尝试 PROXY_SERVER 环境变量 → 端口探测(1081→8080→1080) =====
 SOCKS5_URL = os.getenv("PROXY_SERVER", "")
-if not SOCKS5_URL and os.getenv("NODE_LINK"):
+if not SOCKS5_URL:
     import socket
     def _port_open(port):
         try:
@@ -36,8 +37,12 @@ if not SOCKS5_URL and os.getenv("NODE_LINK"):
             return False
     if _port_open(1081):
         SOCKS5_URL = "http://127.0.0.1:1081"
-    else:
+    elif _port_open(8080):
+        SOCKS5_URL = "http://127.0.0.1:8080"  # sing-box 监听端口
+    elif _port_open(1080):
         SOCKS5_URL = "socks5://127.0.0.1:1080"
+    else:
+        SOCKS5_URL = ""
 
 DISCORD_URL = "https://discord.com/login"
 LOGIN_URL = "https://billing.kerit.cloud"
