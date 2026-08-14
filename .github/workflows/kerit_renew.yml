@@ -47,22 +47,6 @@ jobs:
           sing-box version
           cat /tmp/sing-box.log
 
-      - name: 解析账号信息
-        env:
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-        run: |
-          echo "EMAIL 已配置: ${{ secrets.EMAIL }}"
-          echo "PASSWORD 已配置: ${{ secrets.PASSWORD }}"
-
-      - name: 解析 Telegram 配置
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          echo "TG_TOKEN 已配置: ${{ secrets.TG_TOKEN }}"
-          echo "TG_CHAT_ID 已配置: ${{ secrets.TG_CHAT_ID }}"
-
       - name: 安装 xvfb
         run: |
           sudo apt-get update -qq
@@ -77,7 +61,7 @@ jobs:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-            python kerit_renew_cf_fixed.py
+            python kerit_renew_v3_cf_fixed.py
 
       - name: 上传截图
         if: always()
