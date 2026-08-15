@@ -30,22 +30,25 @@ jobs:
         pip install seleniumbase requests
         seleniumbase install chromedriver
 
-    - name: 设置代理 (sing-box)
-      env:
-        NODE_LINK: ${{ secrets.NODE_LINK }}
-      run: |
-        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-
-    - name: 运行续期脚本
+    # ★ 关键修改：代理设置和运行脚本合并到同一个 step
+    # GitHub Actions 每个 step 是独立 shell，setup_proxy.sh export 的变量
+    # 不会传到下一步，后台 sing-box 进程也可能被清理。
+    # 合并后 setup_proxy.sh 设置的 PROXY 环境变量和 sing-box 进程，
+    # 与 python 脚本在同一个 shell 会话里，脚本就能真正用到代理。
+    - name: 设置代理并运行续期脚本
       env:
         PYTHONIOENCODING: utf-8
+        NODE_LINK: ${{ secrets.NODE_LINK }}
         EMAIL: ${{ secrets.EMAIL }}
         PASSWORD: ${{ secrets.PASSWORD }}
         TG_TOKEN: ${{ secrets.TG_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
+        # 先启动 sing-box 代理（其 export 的变量留在本 step 的 shell 中）
+        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+        # 接着运行脚本，同一个 shell，能继承 PROXY 等环境变量
         xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-          python kerit.py
+          python kerit_renew.py
 
     - name: 🧹 清理旧的工作流运行记录
       if: always()
