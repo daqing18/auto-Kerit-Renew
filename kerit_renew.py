@@ -26,7 +26,7 @@ from seleniumbase import SB
 from selenium.webdriver.common.keys import Keys
 
 # ================= 配置区域 =================
-SOCKS5_URL = os.getenv("PROXY", os.getenv("PROXY_SERVER", ""))
+SOCKS5_URL = os.getenv("PROXY", os.getenv("PROXY_SERVER", os.getenv("NODE_LINK", "")))
 EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
 TG_TOKEN = os.getenv("TG_TOKEN")
