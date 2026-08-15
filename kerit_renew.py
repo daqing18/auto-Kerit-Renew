@@ -275,7 +275,7 @@ class KeritCloudRenewal:
             return True
 
     def click_sponsor_and_complete_renew(self, sb):
-        """点击 Sponsor 并完成续期，匹配朋友流程"""
+        """点击 Sponsor 并完成续期，匹配朋友流程（带浏览器崩溃容错）"""
         try:
             # 1. 点击 Sponsor visit required
             self.log("🖱️ 点击 Sponsor visit required...")
@@ -299,65 +299,138 @@ class KeritCloudRenewal:
                 })();
             """)
             self.log("✅ Sponsor点击执行完成")
-            time.sleep(3)
 
-            # 2. 检查窗口数量
-            handles = sb.driver.window_handles
-            self.log(f"🔎 当前窗口数量: {len(handles)}")
-            for i, h in enumerate(handles):
-                self.log(f"🔎 Window {i}: {h}")
+            # Sponsor 点击可能弹出新窗口/加载广告页，给足时间稳定
+            time.sleep(5)
 
-            # 3. 检查 Turnstile 状态
+            # 2. 检查窗口数量（仅日志用途，失败不影响主流程）
+            try:
+                handles = sb.driver.window_handles
+                self.log(f"🔎 当前窗口数量: {len(handles)}")
+                for i, h in enumerate(handles):
+                    self.log(f"🔎 Window {i}: {h}")
+                # 如果有多个窗口，切回原窗口（renewBtn 在原窗口）
+                if len(handles) > 1:
+                    sb.driver.switch_to.window(handles[0])
+                    self.log("🔎 已切回原窗口")
+                    time.sleep(2)
+            except Exception as e:
+                # 浏览器可能暂时卡顿/崩溃，等待几秒让 WebDriver 恢复
+                self.log(f"⚠️ 窗口读取失败（浏览器可能卡顿），等待恢复: {str(e)[:80]}")
+                time.sleep(8)
+
+            # 3. 辅助函数：带重试的 execute_script（WebDriver 偶发断连时重试）
+            def safe_exec(js, retries=3, wait=3):
+                last_err = None
+                for attempt in range(retries):
+                    try:
+                        return sb.execute_script(js)
+                    except Exception as e:
+                        last_err = e
+                        self.log(f"⚠️ JS执行失败 ({(attempt + 1)}/{retries}): {str(e)[:80]}")
+                        time.sleep(wait)
+                raise last_err
+
+            # 4. 检查 Turnstile 状态
             self.log("🔎 检查 Turnstile 状态")
-            state = sb.execute_script("""
-                return {
-                    token: typeof renewalState !== "undefined" ? renewalState.turnstileToken : "NO",
-                    hidden: document.querySelector("#cf-chl-widget-34adu_response")?.value || ""
-                };
-            """)
-            self.log(f"🔎 Turnstile状态: {state}")
+            try:
+                state = safe_exec("""
+                    return {
+                        token: typeof renewalState !== "undefined" ? renewalState.turnstileToken : "NO",
+                        hidden: document.querySelector("#cf-chl-widget-34adu_response")?.value || ""
+                    };
+                """)
+                self.log(f"🔎 Turnstile状态: {str(state)[:120]}")
+            except Exception as e:
+                self.log(f"⚠️ Turnstile 状态检查失败: {str(e)[:80]}")
 
-            # 4. 等待 Complete Renewal 激活
+            # 5. 等待 Complete Renewal 激活
             self.log("⏳等待 Complete Renewal 激活...")
             time.sleep(3)
 
-            # 5. 查找 Complete Renewal 按钮
+            # 6. 查找 Complete Renewal 按钮（带重试）
             self.log("🔍 查找 Complete Renewal 按钮...")
-            renew_btn = sb.find_element("#renewBtn")
+            renew_btn = None
+            for attempt in range(6):
+                try:
+                    renew_btn = sb.find_element("#renewBtn")
+                    if renew_btn:
+                        break
+                except Exception as e:
+                    self.log(f"⚠️ 找按钮重试 ({(attempt + 1)}/6): {str(e)[:80]}")
+                    time.sleep(3)
+            if renew_btn is None:
+                self.log("❌ Complete Renewal 按钮未找到")
+                return False
             self.log("✅ 找到 Complete Renewal")
 
-            # 6. 聚焦按钮
-            sb.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].focus();", renew_btn)
+            # 7. 聚焦按钮（带重试）
+            focused = False
+            for attempt in range(3):
+                try:
+                    sb.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'}); arguments[0].focus();",
+                        renew_btn
+                    )
+                    focused = True
+                    break
+                except Exception as e:
+                    self.log(f"⚠️ 聚焦失败重试 ({(attempt + 1)}/3): {str(e)[:80]}")
+                    time.sleep(3)
+            if not focused:
+                self.log("⚠️ 按钮聚焦失败，尝试直接 ENTER")
             time.sleep(2)
 
-            # 7. 检查当前焦点
-            active = sb.execute_script("""
-                let el = document.activeElement;
-                return { tag: el.tagName, id: el.id, text: el.innerText, html: el.outerHTML.substring(0, 300) };
-            """)
-            self.log(f"🔎 当前焦点: {active}")
+            # 8. 检查当前焦点
+            try:
+                active = safe_exec("""
+                    let el = document.activeElement;
+                    return { tag: el.tagName, id: el.id, text: el.innerText, html: el.outerHTML.substring(0, 300) };
+                """)
+                self.log(f"🔎 当前焦点: {str(active)[:200]}")
+            except Exception as e:
+                self.log(f"⚠️ 焦点检查失败: {str(e)[:80]}")
             time.sleep(2)
 
-            # 8. 发送 ENTER
+            # 9. 发送 ENTER（带重试）
             self.log("↩️ 发送 ENTER")
-            sb.driver.switch_to.active_element.send_keys(Keys.ENTER)
-            self.log("✅ ENTER发送完成")
+            enter_sent = False
+            for attempt in range(3):
+                try:
+                    sb.driver.switch_to.active_element.send_keys(Keys.ENTER)
+                    enter_sent = True
+                    break
+                except Exception as e:
+                    self.log(f"⚠️ ENTER发送重试 ({(attempt + 1)}/3): {str(e)[:80]}")
+                    time.sleep(3)
+            if enter_sent:
+                self.log("✅ ENTER发送完成")
             time.sleep(5)
 
-            # 9. 检查结果
-            renew_result = sb.execute_script("""
-                return {
-                    success: document.body.innerText.includes("Server renewed successfully"),
-                    error: document.body.innerText.includes("Cannot exceed 7 days validity")
-                };
-            """)
+            # 10. 检查结果（带重试）
+            renew_result = None
+            for attempt in range(3):
+                try:
+                    renew_result = safe_exec("""
+                        return {
+                            success: document.body.innerText.includes("Server renewed successfully"),
+                            error: document.body.innerText.includes("Cannot exceed 7 days validity")
+                        };
+                    """, retries=1)
+                    break
+                except Exception as e:
+                    self.log(f"⚠️ 结果检查重试 ({(attempt + 1)}/3): {str(e)[:80]}")
+                    time.sleep(3)
             self.log(f"🔎 Renewal结果: {renew_result}")
-            if renew_result["success"]:
+            if renew_result and renew_result.get("success"):
                 self.log("🎉 服务器续期成功")
                 return True
-            if renew_result["error"]:
+            if renew_result and renew_result.get("error"):
                 self.log("⚠️ Cannot exceed 7 days validity")
                 return False
+            if renew_result is None:
+                self.log("⚠️ 浏览器异常，无法确认续期结果")
+                return None
             self.log("⚠️ 未检测到续期结果")
             return False
         except Exception as e:
@@ -488,14 +561,24 @@ class KeritCloudRenewal:
 
                 # ====== 8. Sponsor + Complete Renewal ======
                 self.log("✅ 点击sponsor按钮后并点击续期")
-                self.click_sponsor_and_complete_renew(sb)
-                time.sleep(3)
-                sb.scroll_to_bottom()
+                renew_success = self.click_sponsor_and_complete_renew(sb)
 
-                # ====== 9. 完成 ======
-                final_screenshot = f"{self.screenshot_dir}/final.png"
-                sb.save_screenshot(final_screenshot)
-                self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{EMAIL}]\n续期流程完毕", final_screenshot)
+                # ====== 9. 完成：按真实结果发通知，不再无条件"完毕" ======
+                try:
+                    time.sleep(3)
+                    sb.scroll_to_bottom()
+                    final_screenshot = f"{self.screenshot_dir}/final.png"
+                    sb.save_screenshot(final_screenshot)
+                except Exception as e:
+                    self.log(f"⚠️ 截图失败（浏览器可能已挂）: {str(e)[:80]}")
+                    final_screenshot = None
+
+                if renew_success is True:
+                    self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{EMAIL}]\n🎊 续期成功！", final_screenshot)
+                elif renew_success is None:
+                    self.send_telegram_notify(f"⚠️ Kerit.Cloud\n账号：[{EMAIL}]\n浏览器异常，续期结果未确认，请手动检查", final_screenshot)
+                else:
+                    self.send_telegram_notify(f"❌ Kerit.Cloud\n账号：[{EMAIL}]\n续期未完成（可能冷却或按钮未找到）", final_screenshot)
 
             except Exception as e:
                 self.log(f"❌ 运行异常: {e}")
