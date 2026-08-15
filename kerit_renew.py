@@ -275,9 +275,11 @@ class KeritCloudRenewal:
             return True
 
     def click_sponsor_and_complete_renew(self, sb):
-        """点击 Sponsor 并完成续期，匹配朋友流程（带浏览器崩溃容错）"""
+        """点击 Sponsor 并完成续期
+        流程：点 Sponsor(弹出新窗口) → 切回原窗口 → 等 renewBtn 激活 → 点击 → 检查结果
+        """
         try:
-            # 1. 点击 Sponsor visit required
+            # 1. 点击 Sponsor visit required（保留 target=_blank，让它在新窗口弹出）
             self.log("🖱️ 点击 Sponsor visit required...")
             sb.execute_script("""
                 (function(){
@@ -288,7 +290,6 @@ class KeritCloudRenewal:
                     let target = el;
                     for (let i = 0; i < 6; i++) {
                         if (target.tagName == "A" || target.tagName == "BUTTON" || typeof target.onclick == "function") {
-                            if (target.tagName == "A") { target.removeAttribute("target"); }
                             target.click();
                             return;
                         }
@@ -299,142 +300,79 @@ class KeritCloudRenewal:
                 })();
             """)
             self.log("✅ Sponsor点击执行完成")
-
-            # Sponsor 点击可能弹出新窗口/加载广告页，给足时间稳定
             time.sleep(5)
 
-            # 2. 检查窗口数量（仅日志用途，失败不影响主流程）
+            # 2. 切回原窗口（Sponsor 新窗口已弹出，原窗口才有 renewBtn）
             try:
                 handles = sb.driver.window_handles
                 self.log(f"🔎 当前窗口数量: {len(handles)}")
-                for i, h in enumerate(handles):
-                    self.log(f"🔎 Window {i}: {h}")
-                # 如果有多个窗口，切回原窗口（renewBtn 在原窗口）
                 if len(handles) > 1:
                     sb.driver.switch_to.window(handles[0])
                     self.log("🔎 已切回原窗口")
-                    time.sleep(2)
             except Exception as e:
-                # 浏览器可能暂时卡顿/崩溃，等待几秒让 WebDriver 恢复
-                self.log(f"⚠️ 窗口读取失败（浏览器可能卡顿），等待恢复: {str(e)[:80]}")
-                time.sleep(8)
+                self.log(f"⚠️ 窗口读取失败: {str(e)[:60]}（继续在当前窗口操作）")
+        except Exception as e:
+            self.log(f"❌ Sponsor 点击流程失败: {e}")
+            return False
 
-            # 3. 辅助函数：带重试的 execute_script（WebDriver 偶发断连时重试）
-            def safe_exec(js, retries=3, wait=3):
-                last_err = None
-                for attempt in range(retries):
-                    try:
-                        return sb.execute_script(js)
-                    except Exception as e:
-                        last_err = e
-                        self.log(f"⚠️ JS执行失败 ({(attempt + 1)}/{retries}): {str(e)[:80]}")
-                        time.sleep(wait)
-                raise last_err
-
-            # 4. 检查 Turnstile 状态
-            self.log("🔎 检查 Turnstile 状态")
+        # 3. 等待 Complete Renewal 按钮激活（Turnstile token 异步生成，最多等 20 秒）
+        self.log("⏳ 等待 Complete Renewal 激活...")
+        btn_ready = False
+        for _ in range(13):
             try:
-                state = safe_exec("""
-                    return {
-                        token: typeof renewalState !== "undefined" ? renewalState.turnstileToken : "NO",
-                        hidden: document.querySelector("#cf-chl-widget-34adu_response")?.value || ""
-                    };
+                ready = sb.execute_script("""
+                    (function(){
+                        var btn = document.getElementById('renewBtn');
+                        return btn ? !btn.disabled : false;
+                    })()
                 """)
-                self.log(f"🔎 Turnstile状态: {str(state)[:120]}")
+                if ready:
+                    btn_ready = True
+                    break
             except Exception as e:
-                self.log(f"⚠️ Turnstile 状态检查失败: {str(e)[:80]}")
+                self.log(f"⚠️ 检查按钮状态失败: {str(e)[:60]}")
+                time.sleep(2)
+            time.sleep(1.5)
 
-            # 5. 等待 Complete Renewal 激活
-            self.log("⏳等待 Complete Renewal 激活...")
-            time.sleep(3)
+        if not btn_ready:
+            self.log("❌ Complete Renewal 按钮未激活")
+            return False
+        self.log("✅ Complete Renewal 已激活")
 
-            # 6. 查找 Complete Renewal 按钮（带重试）
-            self.log("🔍 查找 Complete Renewal 按钮...")
-            renew_btn = None
-            for attempt in range(6):
-                try:
-                    renew_btn = sb.find_element("#renewBtn")
-                    if renew_btn:
-                        break
-                except Exception as e:
-                    self.log(f"⚠️ 找按钮重试 ({(attempt + 1)}/6): {str(e)[:80]}")
-                    time.sleep(3)
-            if renew_btn is None:
-                self.log("❌ Complete Renewal 按钮未找到")
+        # 4. 点击 Complete Renewal（JS 直接点击 + 兜底 ENTER）
+        try:
+            self.log("🖱️ 点击 Complete Renewal...")
+            sb.execute_script("document.getElementById('renewBtn').click();")
+            self.log("✅ 已点击 Complete Renewal")
+        except Exception as e:
+            self.log(f"⚠️ JS 点击失败: {str(e)[:60]}，尝试 ENTER")
+            try:
+                sb.driver.switch_to.active_element.send_keys(Keys.ENTER)
+                self.log("✅ ENTER 已发送")
+            except Exception as e2:
+                self.log(f"❌ ENTER 也失败: {str(e2)[:60]}")
                 return False
-            self.log("✅ 找到 Complete Renewal")
+        time.sleep(5)
 
-            # 7. 聚焦按钮（带重试）
-            focused = False
-            for attempt in range(3):
-                try:
-                    sb.execute_script(
-                        "arguments[0].scrollIntoView({block:'center'}); arguments[0].focus();",
-                        renew_btn
-                    )
-                    focused = True
-                    break
-                except Exception as e:
-                    self.log(f"⚠️ 聚焦失败重试 ({(attempt + 1)}/3): {str(e)[:80]}")
-                    time.sleep(3)
-            if not focused:
-                self.log("⚠️ 按钮聚焦失败，尝试直接 ENTER")
-            time.sleep(2)
-
-            # 8. 检查当前焦点
-            try:
-                active = safe_exec("""
-                    let el = document.activeElement;
-                    return { tag: el.tagName, id: el.id, text: el.innerText, html: el.outerHTML.substring(0, 300) };
-                """)
-                self.log(f"🔎 当前焦点: {str(active)[:200]}")
-            except Exception as e:
-                self.log(f"⚠️ 焦点检查失败: {str(e)[:80]}")
-            time.sleep(2)
-
-            # 9. 发送 ENTER（带重试）
-            self.log("↩️ 发送 ENTER")
-            enter_sent = False
-            for attempt in range(3):
-                try:
-                    sb.driver.switch_to.active_element.send_keys(Keys.ENTER)
-                    enter_sent = True
-                    break
-                except Exception as e:
-                    self.log(f"⚠️ ENTER发送重试 ({(attempt + 1)}/3): {str(e)[:80]}")
-                    time.sleep(3)
-            if enter_sent:
-                self.log("✅ ENTER发送完成")
-            time.sleep(5)
-
-            # 10. 检查结果（带重试）
-            renew_result = None
-            for attempt in range(3):
-                try:
-                    renew_result = safe_exec("""
-                        return {
-                            success: document.body.innerText.includes("Server renewed successfully"),
-                            error: document.body.innerText.includes("Cannot exceed 7 days validity")
-                        };
-                    """, retries=1)
-                    break
-                except Exception as e:
-                    self.log(f"⚠️ 结果检查重试 ({(attempt + 1)}/3): {str(e)[:80]}")
-                    time.sleep(3)
+        # 5. 检查结果（只查一次）
+        try:
+            renew_result = sb.execute_script("""
+                return {
+                    success: document.body.innerText.includes("Server renewed successfully"),
+                    error: document.body.innerText.includes("Cannot exceed 7 days validity")
+                };
+            """)
             self.log(f"🔎 Renewal结果: {renew_result}")
-            if renew_result and renew_result.get("success"):
+            if renew_result.get("success"):
                 self.log("🎉 服务器续期成功")
                 return True
-            if renew_result and renew_result.get("error"):
+            if renew_result.get("error"):
                 self.log("⚠️ Cannot exceed 7 days validity")
                 return False
-            if renew_result is None:
-                self.log("⚠️ 浏览器异常，无法确认续期结果")
-                return None
             self.log("⚠️ 未检测到续期结果")
             return False
         except Exception as e:
-            self.log(f"❌ Renewal流程失败: {e}")
+            self.log(f"⚠️ 结果检查失败: {str(e)[:60]}")
             return False
 
     def run(self):
