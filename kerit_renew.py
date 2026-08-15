@@ -26,7 +26,18 @@ from seleniumbase import SB
 from selenium.webdriver.common.keys import Keys
 
 # ================= 配置区域 =================
-SOCKS5_URL = os.getenv("PROXY", os.getenv("PROXY_SERVER", os.getenv("NODE_LINK", "")))
+# 代理地址：优先 PROXY/PROXY_SERVER（setup_proxy.sh 设置的本地代理），
+# NODE_LINK 可能是订阅链接，不能直接当代理地址用，只有它本身是 socks/http 开头才接受
+_node_link = os.getenv("NODE_LINK", "")
+_proxy_env = os.getenv("PROXY", os.getenv("PROXY_SERVER", ""))
+if _proxy_env and re.match(r'^(socks5|socks4|http|https)://', _proxy_env):
+    SOCKS5_URL = _proxy_env
+elif _node_link and re.match(r'^(socks5|socks4|http|https)://', _node_link):
+    SOCKS5_URL = _node_link
+else:
+    # 订阅链接或未设置：使用本地 sing-box 默认端口
+    SOCKS5_URL = "socks5://127.0.0.1:1080"
+print(f"[DEBUG] 代理地址: {SOCKS5_URL}")
 EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
 TG_TOKEN = os.getenv("TG_TOKEN")
