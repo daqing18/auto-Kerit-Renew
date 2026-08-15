@@ -354,19 +354,15 @@ class KeritCloudRenewal:
                 return False
         time.sleep(5)
 
-        # 5. 检查结果（只查一次）
+        # 5. 检查结果（读页面源码，不依赖 JS 执行，避免 Uncaught）
         try:
-            renew_result = sb.execute_script("""
-                return {
-                    success: document.body.innerText.includes("Server renewed successfully"),
-                    error: document.body.innerText.includes("Cannot exceed 7 days validity")
-                };
-            """)
-            self.log(f"🔎 Renewal结果: {renew_result}")
-            if renew_result.get("success"):
+            time.sleep(5)
+            page_text = sb.get_page_source()
+            # 右下角显示 "Server renewed" 或 "server renewed" 算成功
+            if re.search(r'(?i)server\s*renewed', page_text):
                 self.log("🎉 服务器续期成功")
                 return True
-            if renew_result.get("error"):
+            if re.search(r'(?i)cannot\s*exceed\s*7\s*days', page_text):
                 self.log("⚠️ Cannot exceed 7 days validity")
                 return False
             self.log("⚠️ 未检测到续期结果")
