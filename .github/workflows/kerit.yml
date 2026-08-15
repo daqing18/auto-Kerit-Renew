@@ -31,7 +31,6 @@ jobs:
         seleniumbase install chromedriver
 
     - name: 设置代理 (sing-box)
-      continue-on-error: true
       env:
         NODE_LINK: ${{ secrets.NODE_LINK }}
       run: |
@@ -44,8 +43,6 @@ jobs:
         PASSWORD: ${{ secrets.PASSWORD }}
         TG_TOKEN: ${{ secrets.TG_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        IS_PROXY: "true"
-        PROXY_SERVER: "http://127.0.0.1:1081"
       run: |
         xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
           python kerit.py
