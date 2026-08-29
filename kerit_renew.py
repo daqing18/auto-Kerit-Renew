@@ -274,10 +274,84 @@ class KeritCloudRenewal:
             self.log(f"⚠️ 检查续期状态失败: {e}")
             return True
 
+    def get_remaining_days(self, sb) -> int:
+        """从页面读取剩余天数
+        策略：优先用 JS 精确定位 DAYS LEFT 卡片，其次用严格 regex。
+        旧版 regex r'(\d+)\s*days?' 会错误匹配到 tooltip 里的 "7 day limit"
+        导致 days_before=7，触发 if days_before >= 7 提前 return False，
+        导致整个续期流程被跳过。
+        """
+        try:
+            page_text = sb.get_page_source()
+
+            # 方式1: JS 精确定位 DAYS LEFT 卡片（最可靠）
+            days = sb.execute_script("""
+                (function(){
+                    // 找包含 "DAYS LEFT" 文字的卡片
+                    let all = document.querySelectorAll('*');
+                    for (let el of all) {
+                        if ((el.textContent || '').toUpperCase().includes('DAYS LEFT')) {
+                            // 取这个元素的父级卡片容器（最多上探3层）
+                            let card = el;
+                            for (let i = 0; i < 4; i++) {
+                                let parent = card.parentElement;
+                                if (!parent || parent === document.body) break;
+                                card = parent;
+                            }
+                            let text = (card.textContent || '').trim();
+                            // 只匹配 0-7 范围内的数字（排除 MB/GB 等大数）
+                            let m = text.match(/\\b(0|[1-7])\\b/);
+                            if (m) return parseInt(m[1]);
+                        }
+                    }
+                    return -1;
+                })()
+            """)
+            if days and 0 <= days <= 7:
+                self.log(f"📅 [JS] DAYS LEFT 卡片检测到: {days} 天")
+                return days
+
+            # 方式2: 严格 regex —— 只匹配 "N/7" 格式（如 "4/7"）
+            m = re.search(r'\b(\d{1,2})\s*/\s*7\b', page_text)
+            if m:
+                val = int(m.group(1))
+                if 0 <= val <= 7:
+                    self.log(f"📅 [regex] N/7 格式匹配到: {val}")
+                    return val
+
+            # 方式3: 匹配 "X Days" 但要求 X 在 0-7 之间，且后面紧跟 7 或 limit
+            m = re.search(r'\b([0-6])\s*Days?\b.*?(?:7\s*day|limit|max)', page_text, re.IGNORECASE)
+            if m:
+                val = int(m.group(1))
+                self.log(f"📅 [regex] Days+limit 匹配到: {val}")
+                return val
+
+            # 方式4: 找到 "DAYS LEFT" 附近的最多300字符文本，从中提取 0-7 的数字
+            idx = page_text.upper().find('DAYS LEFT')
+            if idx != -1:
+                chunk = page_text[idx:idx+300]
+                m = re.search(r'\b([0-7])\\b', chunk)
+                if m:
+                    val = int(m.group(1))
+                    self.log(f"📅 [regex] DAYS LEFT 附近匹配到: {val}")
+                    return val
+
+            self.log("⚠️ [get_remaining_days] 未匹配到有效天数，返回 0")
+            return 0
+        except Exception as e:
+            self.log(f"⚠️ get_remaining_days 异常: {e}")
+            return 0
+
     def click_sponsor_and_complete_renew(self, sb):
         """点击 Sponsor 并完成续期
-        流程：点 Sponsor(弹出新窗口) → 切回原窗口 → 等 renewBtn 激活 → 点击 → 检查结果
+        流程：先读天数 → 点 Sponsor(弹出新窗口) → 切回原窗口 → 等 renewBtn 激活 → 点击 → 对比天数
         """
+        # 0. 续期前读天数
+        days_before = self.get_remaining_days(sb)
+        self.log(f"📅 续期前剩余天数: {days_before}（来源：DAYS LEFT 卡片，非 tooltip）")
+        if days_before >= 7:
+            self.log("⚠️ 已达最大天数(7天)，无需续期")
+            return False
         try:
             # 1. 点击 Sponsor visit required（保留 target=_blank，让它在新窗口弹出）
             self.log("🖱️ 点击 Sponsor visit required...")
@@ -354,18 +428,27 @@ class KeritCloudRenewal:
                 return False
         time.sleep(5)
 
-        # 5. 检查结果（读页面源码，不依赖 JS 执行，避免 Uncaught）
+        # 5. 检查结果：天数对比 + 文本匹配双重验证
         try:
             time.sleep(5)
+            days_after = self.get_remaining_days(sb)
+            self.log(f"📅 续期后剩余天数: {days_after}")
+
+            if days_after > days_before:
+                self.log(f"🎉 天数从 {days_before} 增加到 {days_after}，续期成功！")
+                return True
+            if days_after >= 7:
+                self.log("⚠️ 已达最大天数(7天)")
+                return False
+            # 天数没变，fallback 到文本匹配
             page_text = sb.get_page_source()
-            # 右下角显示 "Server renewed" 或 "server renewed" 算成功
             if re.search(r'(?i)server\s*renewed', page_text):
-                self.log("🎉 服务器续期成功")
+                self.log("🎉 服务器续期成功（文本匹配）")
                 return True
             if re.search(r'(?i)cannot\s*exceed\s*7\s*days', page_text):
                 self.log("⚠️ Cannot exceed 7 days validity")
                 return False
-            self.log("⚠️ 未检测到续期结果")
+            self.log("⚠️ 未检测到续期结果（天数未增加，文本未匹配）")
             return False
         except Exception as e:
             self.log(f"⚠️ 结果检查失败: {str(e)[:60]}")
