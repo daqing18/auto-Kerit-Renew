@@ -284,24 +284,42 @@ class KeritCloudRenewal:
         try:
             page_text = sb.get_page_source()
 
-            # 方式1: JS 精确定位 DAYS LEFT 卡片（最可靠）
+            # 方式1: JS 精确定位剩余天数
+            # 策略：优先找文本就是 "N Days" 的叶子节点（最精确，例如 "1 Days"）
+            #       其次回退到 DAYS LEFT 卡片附近
             days = sb.execute_script("""
                 (function(){
-                    // 找包含 "DAYS LEFT" 文字的卡片
+                    // 优先：整段文本就是 "N Days" 的元素（排除过长 tooltip）
                     let all = document.querySelectorAll('*');
+                    let best = null;
                     for (let el of all) {
-                        if ((el.textContent || '').toUpperCase().includes('DAYS LEFT')) {
-                            // 取这个元素的父级卡片容器（最多上探3层）
-                            let card = el;
-                            for (let i = 0; i < 4; i++) {
-                                let parent = card.parentElement;
-                                if (!parent || parent === document.body) break;
-                                card = parent;
+                        let t = (el.innerText || el.textContent || '').trim();
+                        if (!t || t.length > 30) continue;
+                        let m = t.match(/^\\s*(\\d{1,2})\\s*days?\\s*$/i);
+                        if (m) {
+                            let v = parseInt(m[1]);
+                            if (v >= 0 && v <= 7) {
+                                if (!best || t.length < best.len) best = { v: v, len: t.length, text: t };
                             }
-                            let text = (card.textContent || '').trim();
-                            // 只匹配 0-7 范围内的数字（排除 MB/GB 等大数）
-                            let m = text.match(/\\b(0|[1-7])\\b/);
-                            if (m) return parseInt(m[1]);
+                        }
+                    }
+                    if (best) return best.v;
+                    // 回退：找包含 DAYS LEFT 的元素，向上取 DAYS LEFT 后紧跟的数字
+                    let best2 = null;
+                    for (let el of all) {
+                        let t = (el.textContent || '').toUpperCase();
+                        if (t.includes('DAYS LEFT') && t.length < 300) {
+                            if (!best2 || t.length < best2.len) best2 = { el, len: t.length };
+                        }
+                    }
+                    if (best2) {
+                        let node = best2.el;
+                        for (let i = 0; i < 4; i++) {
+                            let text = (node.innerText || node.textContent || '').replace(/\\s+/g, ' ');
+                            let m = text.match(/DAYS\\s*LEFT[^\\d]{0,15}(\\d{1,2})/i);
+                            if (m) { let v = parseInt(m[1]); if (v >= 0 && v <= 7) return v; }
+                            node = node.parentElement;
+                            if (!node || node === document.body) break;
                         }
                     }
                     return -1;
@@ -320,17 +338,18 @@ class KeritCloudRenewal:
                     return val
 
             # 方式3: 匹配 "X Days" 但要求 X 在 0-7 之间，且后面紧跟 7 或 limit
+            # 用负向先行断言排除 "7 day limit" 这类 tooltip 文字
             m = re.search(r'\b([0-6])\s*Days?\b.*?(?:7\s*day|limit|max)', page_text, re.IGNORECASE)
             if m:
                 val = int(m.group(1))
                 self.log(f"📅 [regex] Days+limit 匹配到: {val}")
                 return val
 
-            # 方式4: 找到 "DAYS LEFT" 附近的最多300字符文本，从中提取 0-7 的数字
+            # 方式4: 找到 "DAYS LEFT" 附近的最多200字符文本，从中提取 0-7 的数字
             idx = page_text.upper().find('DAYS LEFT')
             if idx != -1:
                 chunk = page_text[idx:idx+300]
-                m = re.search(r'\b([0-7])\\b', chunk)
+                m = re.search(r'\b([0-7])\b', chunk)
                 if m:
                     val = int(m.group(1))
                     self.log(f"📅 [regex] DAYS LEFT 附近匹配到: {val}")
@@ -345,13 +364,15 @@ class KeritCloudRenewal:
     def click_sponsor_and_complete_renew(self, sb):
         """点击 Sponsor 并完成续期
         流程：先读天数 → 点 Sponsor(弹出新窗口) → 切回原窗口 → 等 renewBtn 激活 → 点击 → 对比天数
+        返回: (success: bool, days_before: int, days_after: int)
         """
         # 0. 续期前读天数
         days_before = self.get_remaining_days(sb)
         self.log(f"📅 续期前剩余天数: {days_before}（来源：DAYS LEFT 卡片，非 tooltip）")
         if days_before >= 7:
             self.log("⚠️ 已达最大天数(7天)，无需续期")
-            return False
+            return (False, days_before, days_before)
+
         try:
             # 1. 点击 Sponsor visit required（保留 target=_blank，让它在新窗口弹出）
             self.log("🖱️ 点击 Sponsor visit required...")
@@ -377,17 +398,38 @@ class KeritCloudRenewal:
             time.sleep(5)
 
             # 2. 切回原窗口（Sponsor 新窗口已弹出，原窗口才有 renewBtn）
+            # 加固：重试读取窗口句柄，按 URL 精确找 billing.kerit.cloud 原窗口
             try:
-                handles = sb.driver.window_handles
-                self.log(f"🔎 当前窗口数量: {len(handles)}")
-                if len(handles) > 1:
-                    sb.driver.switch_to.window(handles[0])
-                    self.log("🔎 已切回原窗口")
+                original = None
+                for attempt in range(5):
+                    try:
+                        handles = sb.driver.window_handles
+                        self.log(f"🔎 当前窗口数量: {len(handles)}")
+                        if len(handles) > 1:
+                            # 优先按 URL 匹配原窗口
+                            for h in handles:
+                                try:
+                                    sb.driver.switch_to.window(h)
+                                    if "billing.kerit.cloud" in sb.driver.current_url:
+                                        original = h
+                                        break
+                                except Exception:
+                                    continue
+                            if original is None:
+                                original = handles[0]
+                            sb.driver.switch_to.window(original)
+                            self.log(f"🔎 已切回原窗口: {sb.driver.current_url}")
+                        else:
+                            self.log("🔎 只有1个窗口，无需切换")
+                        break
+                    except Exception as e:
+                        self.log(f"⚠️ 窗口读取重试 {attempt + 1}/5: {str(e)[:50]}")
+                        time.sleep(3)
             except Exception as e:
                 self.log(f"⚠️ 窗口读取失败: {str(e)[:60]}（继续在当前窗口操作）")
         except Exception as e:
             self.log(f"❌ Sponsor 点击流程失败: {e}")
-            return False
+            return (False, days_before, -1)
 
         # 3. 等待 Complete Renewal 按钮激活（Turnstile token 异步生成，最多等 20 秒）
         self.log("⏳ 等待 Complete Renewal 激活...")
@@ -410,7 +452,7 @@ class KeritCloudRenewal:
 
         if not btn_ready:
             self.log("❌ Complete Renewal 按钮未激活")
-            return False
+            return (False, days_before, -1)
         self.log("✅ Complete Renewal 已激活")
 
         # 4. 点击 Complete Renewal（JS 直接点击 + 兜底 ENTER）
@@ -425,10 +467,10 @@ class KeritCloudRenewal:
                 self.log("✅ ENTER 已发送")
             except Exception as e2:
                 self.log(f"❌ ENTER 也失败: {str(e2)[:60]}")
-                return False
+                return (False, days_before, -1)
         time.sleep(5)
 
-        # 5. 检查结果：天数对比 + 文本匹配双重验证
+        # 5. 检查结果：以"天数真的增加"为唯一成功标准
         try:
             time.sleep(5)
             days_after = self.get_remaining_days(sb)
@@ -436,23 +478,27 @@ class KeritCloudRenewal:
 
             if days_after > days_before:
                 self.log(f"🎉 天数从 {days_before} 增加到 {days_after}，续期成功！")
-                return True
+                return (True, days_before, days_after)
             if days_after >= 7:
                 self.log("⚠️ 已达最大天数(7天)")
-                return False
-            # 天数没变，fallback 到文本匹配
-            page_text = sb.get_page_source()
-            if re.search(r'(?i)server\s*renewed', page_text):
-                self.log("🎉 服务器续期成功（文本匹配）")
-                return True
-            if re.search(r'(?i)cannot\s*exceed\s*7\s*days', page_text):
-                self.log("⚠️ Cannot exceed 7 days validity")
-                return False
-            self.log("⚠️ 未检测到续期结果（天数未增加，文本未匹配）")
-            return False
+                return (True, days_before, days_after)
+            # 天数没变：刷新页面再读一次，排除缓存/旧快照
+            try:
+                sb.reload_page()
+                time.sleep(6)
+                days_after2 = self.get_remaining_days(sb)
+                self.log(f"📅 刷新后剩余天数: {days_after2}")
+                if days_after2 > days_before:
+                    self.log(f"🎉 天数从 {days_before} 增加到 {days_after2}，续期成功！")
+                    return (True, days_before, days_after2)
+            except Exception as e:
+                self.log(f"⚠️ 刷新重读失败: {str(e)[:60]}")
+            # 天数确实没变 = 续期未生效，绝不误报成功
+            self.log("❌ 续期未生效：天数未增加（可能 Sponsor 未完成或续期被拒）")
+            return (False, days_before, days_after)
         except Exception as e:
             self.log(f"⚠️ 结果检查失败: {str(e)[:60]}")
-            return False
+            return (False, days_before, -1)
 
     def run(self):
         self.log("=" * 40)
@@ -569,7 +615,8 @@ class KeritCloudRenewal:
                 if not renew_btn_clicked:
                     self.log("❌ Renew Server 按钮未找到")
                     sb.save_screenshot(f"{self.screenshot_dir}/no_renew_btn.png")
-                    self.send_telegram_notify(f"❌ Kerit.Cloud\n✅账号：[{EMAIL}]\nRenew Server 按钮未找到", 
+                    cur_days = self.get_remaining_days(sb)
+                    self.send_telegram_notify(f"❌ Kerit.Cloud\n✅账号：[{EMAIL}]\nRenew Server 按钮未找到\n📅 当前剩余天数: {cur_days}", 
                                                f"{self.screenshot_dir}/no_renew_btn.png")
                     return
                 time.sleep(10)
@@ -578,7 +625,10 @@ class KeritCloudRenewal:
 
                 # ====== 8. Sponsor + Complete Renewal ======
                 self.log("✅ 点击sponsor按钮后并点击续期")
-                renew_success = self.click_sponsor_and_complete_renew(sb)
+                renew_result = self.click_sponsor_and_complete_renew(sb)
+                renew_success = renew_result[0]
+                renew_days_before = renew_result[1]
+                renew_days_after = renew_result[2]
 
                 # ====== 9. 完成：按真实结果发通知，不再无条件"完毕" ======
                 try:
@@ -591,11 +641,23 @@ class KeritCloudRenewal:
                     final_screenshot = None
 
                 if renew_success is True:
-                    self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{EMAIL}]\n🎊 续期成功！", final_screenshot)
+                    if renew_days_after >= 0:
+                        self.send_telegram_notify(
+                            f"🎉 Kerit.Cloud\n✅账号：[{EMAIL}]\n🎊 续期成功！\n"
+                            f"📅 续期前剩余天数: {renew_days_before}，续期后剩余天数: {renew_days_after}",
+                            final_screenshot)
+                    else:
+                        self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{EMAIL}]\n🎊 续期成功！", final_screenshot)
                 elif renew_success is None:
                     self.send_telegram_notify(f"⚠️ Kerit.Cloud\n账号：[{EMAIL}]\n浏览器异常，续期结果未确认，请手动检查", final_screenshot)
                 else:
-                    self.send_telegram_notify(f"❌ Kerit.Cloud\n账号：[{EMAIL}]\n续期未完成（可能冷却或按钮未找到）", final_screenshot)
+                    if renew_days_after >= 0:
+                        self.send_telegram_notify(
+                            f"❌ Kerit.Cloud\n账号：[{EMAIL}]\n续期未完成\n"
+                            f"📅 续期前剩余天数: {renew_days_before}，续期后剩余天数: {renew_days_after}",
+                            final_screenshot)
+                    else:
+                        self.send_telegram_notify(f"❌ Kerit.Cloud\n账号：[{EMAIL}]\n续期未完成（可能冷却或按钮未找到）", final_screenshot)
 
             except Exception as e:
                 self.log(f"❌ 运行异常: {e}")
