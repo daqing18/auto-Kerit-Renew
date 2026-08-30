@@ -585,7 +585,8 @@ class KeritCloudRenewal:
                     self.log("✅ 冷却中，无需续期")
                     final_screenshot = f"{self.screenshot_dir}/final.png"
                     sb.save_screenshot(final_screenshot)
-                    self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{EMAIL}] 冷却中，无需续期", final_screenshot)
+                    cur_days = self.get_remaining_days(sb)
+                    self.send_telegram_notify(f"🎉 Kerit.Cloud\n✅账号：[{EMAIL}]\n⏳ 冷却中，无需续期\n📅 当前剩余天数: {cur_days}", final_screenshot)
                     return
 
                 # ====== 7. 点击 Renew Server 按钮 ======
