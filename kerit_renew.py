@@ -363,7 +363,12 @@ class KeritCloudRenewal:
 
     def click_sponsor_and_complete_renew(self, sb):
         """点击 Sponsor 并完成续期
-        流程：先读天数 → 点 Sponsor(弹出新窗口) → 切回原窗口 → 等 renewBtn 激活 → 点击 → 对比天数
+        流程（完全模拟手动操作，单次线性，任一检查不过立即终止本次续期）：
+          读天数 → 点 Sponsor → 浏览器健康检查 → 等 Sponsor 页加载完成
+          → 关闭 Sponsor 页 → 验证回落续期页 → 等 renewBtn 激活
+          → 最终三重检查 → 点一次 Complete Renewal → 验证天数
+        注意：所有检查只执行一次，任何一项没过就【关闭本次续期】返回失败，
+              绝不重试、绝不继续，因为机会只有一次，状态不对重试只会浪费。
         返回: (success: bool, days_before: int, days_after: int)
         """
         # 0. 续期前读天数
@@ -373,8 +378,8 @@ class KeritCloudRenewal:
             self.log("⚠️ 已达最大天数(7天)，无需续期")
             return (False, days_before, days_before)
 
+        # ===== 检查①：点击 Sponsor visit required =====
         try:
-            # 1. 点击 Sponsor visit required（保留 target=_blank，让它在新窗口弹出）
             self.log("🖱️ 点击 Sponsor visit required...")
             sb.execute_script("""
                 (function(){
@@ -395,44 +400,94 @@ class KeritCloudRenewal:
                 })();
             """)
             self.log("✅ Sponsor点击执行完成")
-            time.sleep(5)
-
-            # 2. 切回原窗口（Sponsor 新窗口已弹出，原窗口才有 renewBtn）
-            # 加固：重试读取窗口句柄，按 URL 精确找 billing.kerit.cloud 原窗口
-            try:
-                original = None
-                for attempt in range(5):
-                    try:
-                        handles = sb.driver.window_handles
-                        self.log(f"🔎 当前窗口数量: {len(handles)}")
-                        if len(handles) > 1:
-                            # 优先按 URL 匹配原窗口
-                            for h in handles:
-                                try:
-                                    sb.driver.switch_to.window(h)
-                                    if "billing.kerit.cloud" in sb.driver.current_url:
-                                        original = h
-                                        break
-                                except Exception:
-                                    continue
-                            if original is None:
-                                original = handles[0]
-                            sb.driver.switch_to.window(original)
-                            self.log(f"🔎 已切回原窗口: {sb.driver.current_url}")
-                        else:
-                            self.log("🔎 只有1个窗口，无需切换")
-                        break
-                    except Exception as e:
-                        self.log(f"⚠️ 窗口读取重试 {attempt + 1}/5: {str(e)[:50]}")
-                        time.sleep(3)
-            except Exception as e:
-                self.log(f"⚠️ 窗口读取失败: {str(e)[:60]}（继续在当前窗口操作）")
         except Exception as e:
-            self.log(f"❌ Sponsor 点击流程失败: {e}")
+            self.log(f"❌ 检查①失败（Sponsor 点击失败）: {e}，关闭本次续期")
             return (False, days_before, -1)
 
-        # 3. 等待 Complete Renewal 按钮激活（Turnstile token 异步生成，最多等 20 秒）
-        self.log("⏳ 等待 Complete Renewal 激活...")
+        # ===== 检查②：浏览器健康检查（解决点 Sponsor 后 CDP/HTTPConnectionPool 抖动）=====
+        self.log("🩺 检查②：浏览器健康检查...")
+        browser_ok = False
+        for hc in range(10):  # 最多 ~30s 等待 CDP 恢复
+            try:
+                handles = list(sb.driver.window_handles)
+                browser_ok = True
+                self.log(f"   ✅ 浏览器正常，当前窗口数: {len(handles)}")
+                break
+            except Exception as e:
+                self.log(f"   ⚠️ 浏览器/CDP 未就绪 {hc+1}/10: {str(e)[:60]}")
+                time.sleep(3)
+        if not browser_ok:
+            self.log("❌ 检查②失败（浏览器连接异常/疑似崩溃），关闭本次续期")
+            return (False, days_before, -1)
+
+        # ===== 检查③：等 Sponsor 页面真正加载完成 =====
+        self.log("⏳ 检查③：等待 Sponsor 页面加载完成...")
+        sponsor_loaded = False
+        for _ in range(12):  # 最多 ~24s
+            try:
+                for h in list(sb.driver.window_handles):
+                    try:
+                        sb.driver.switch_to.window(h)
+                        if "billing.kerit.cloud" not in sb.driver.current_url:
+                            st = sb.execute_script("return document.readyState;")
+                            if st == "complete":
+                                sponsor_loaded = True
+                                break
+                    except Exception:
+                        continue
+                if sponsor_loaded:
+                    break
+            except Exception as e:
+                self.log(f"   ⚠️ 等待 Sponsor 加载重试: {str(e)[:50]}")
+            time.sleep(2)
+        if not sponsor_loaded:
+            self.log("❌ 检查③失败（Sponsor 页面未加载完成），关闭本次续期")
+            return (False, days_before, -1)
+        self.log("✅ 检查③通过：Sponsor 页面已加载完成")
+
+        # ===== 检查④：关闭 Sponsor 新窗口，并验证回落到续期页 =====
+        self.log("🔎 检查④：关闭 Sponsor 窗口并验证回落...")
+        back_ok = False
+        try:
+            closed_any = False
+            for h in list(sb.driver.window_handles):
+                try:
+                    sb.driver.switch_to.window(h)
+                    if "billing.kerit.cloud" not in sb.driver.current_url:
+                        sb.driver.close()
+                        closed_any = True
+                except Exception:
+                    continue
+            for h in list(sb.driver.window_handles):
+                try:
+                    sb.driver.switch_to.window(h)
+                    if "billing.kerit.cloud" in sb.driver.current_url:
+                        back_ok = True
+                        break
+                except Exception:
+                    continue
+            if closed_any:
+                self.log("   ✅ 已关闭 Sponsor 新窗口")
+        except Exception as e:
+            self.log(f"   ⚠️ 关闭 Sponsor 窗口异常: {str(e)[:60]}")
+        if not back_ok:
+            self.log("❌ 检查④失败（未回落到续期页），关闭本次续期")
+            return (False, days_before, -1)
+        self.log(f"✅ 检查④通过：已回落续期页 {sb.driver.current_url}")
+
+        # ===== 检查⑤：确认当前在续期页 =====
+        try:
+            cur_url = sb.driver.current_url
+            if "billing.kerit.cloud" not in cur_url:
+                self.log(f"❌ 检查⑤失败（当前不在续期页: {cur_url}），关闭本次续期")
+                return (False, days_before, -1)
+        except Exception as e:
+            self.log(f"❌ 检查⑤异常: {str(e)[:60]}，关闭本次续期")
+            return (False, days_before, -1)
+        self.log("✅ 检查⑤通过：当前在续期页")
+
+        # ===== 检查⑥：等 renewBtn 激活（Sponsor 完成 + Turnstile token 异步生成，最多 ~20s）=====
+        self.log("⏳ 检查⑥：等待 Complete Renewal 激活...")
         btn_ready = False
         for _ in range(13):
             try:
@@ -446,16 +501,39 @@ class KeritCloudRenewal:
                     btn_ready = True
                     break
             except Exception as e:
-                self.log(f"⚠️ 检查按钮状态失败: {str(e)[:60]}")
+                self.log(f"   ⚠️ 检查按钮状态失败: {str(e)[:60]}")
                 time.sleep(2)
             time.sleep(1.5)
-
         if not btn_ready:
-            self.log("❌ Complete Renewal 按钮未激活")
+            self.log("❌ 检查⑥失败（Complete Renewal 未激活），关闭本次续期")
             return (False, days_before, -1)
-        self.log("✅ Complete Renewal 已激活")
+        self.log("✅ 检查⑥通过：Complete Renewal 已激活")
 
-        # 4. 点击 Complete Renewal（JS 直接点击 + 兜底 ENTER）
+        # ===== 检查⑦：点击前最终三重检查（机会未消耗，全部通过才点击）=====
+        #   ① 当前在续期页(billing.kerit.cloud)
+        #   ② renewBtn 按钮存在
+        #   ③ renewBtn 已激活(未disabled)
+        try:
+            final_url = sb.driver.current_url
+            final_btn = sb.execute_script("""
+                (function(){
+                    var btn = document.getElementById('renewBtn');
+                    return btn ? {exists:true, disabled:btn.disabled} : {exists:false, disabled:true};
+                })()
+            """)
+            url_ok = "billing.kerit.cloud" in (final_url or "")
+            btn_exists = bool(final_btn and final_btn.get("exists"))
+            btn_active = bool(final_btn and not final_btn.get("disabled"))
+            self.log(f"🔎 检查⑦：URL={'OK' if url_ok else 'FAIL'} | 按钮存在={'OK' if btn_exists else 'FAIL'} | 按钮激活={'OK' if btn_active else 'FAIL'}")
+            if not (url_ok and btn_exists and btn_active):
+                self.log(f"❌ 检查⑦失败（最终检查未通过，URL={final_url}），关闭本次续期")
+                return (False, days_before, -1)
+        except Exception as e:
+            self.log(f"❌ 检查⑦异常: {str(e)[:60]}，关闭本次续期")
+            return (False, days_before, -1)
+        self.log("✅ 检查⑦通过：全部就绪，开始点击 Complete Renewal")
+
+        # ===== 点击 Complete Renewal（只点一次，绝不重复）=====
         try:
             self.log("🖱️ 点击 Complete Renewal...")
             sb.execute_script("document.getElementById('renewBtn').click();")
@@ -468,21 +546,20 @@ class KeritCloudRenewal:
             except Exception as e2:
                 self.log(f"❌ ENTER 也失败: {str(e2)[:60]}")
                 return (False, days_before, -1)
-        time.sleep(5)
 
-        # 5. 检查结果：以"天数真的增加"为唯一成功标准
+        time.sleep(8)
+
+        # ===== 验证：天数真的增加才算成功（刷新重读一次排除缓存，但绝不重复点击）=====
         try:
-            time.sleep(5)
             days_after = self.get_remaining_days(sb)
             self.log(f"📅 续期后剩余天数: {days_after}")
-
             if days_after > days_before:
                 self.log(f"🎉 天数从 {days_before} 增加到 {days_after}，续期成功！")
                 return (True, days_before, days_after)
             if days_after >= 7:
                 self.log("⚠️ 已达最大天数(7天)")
                 return (True, days_before, days_after)
-            # 天数没变：刷新页面再读一次，排除缓存/旧快照
+            # 天数没变：刷新再读一次，排除缓存/旧快照
             try:
                 sb.reload_page()
                 time.sleep(6)
@@ -491,10 +568,13 @@ class KeritCloudRenewal:
                 if days_after2 > days_before:
                     self.log(f"🎉 天数从 {days_before} 增加到 {days_after2}，续期成功！")
                     return (True, days_before, days_after2)
+                if days_after2 >= 7:
+                    self.log("⚠️ 已达最大天数(7天)")
+                    return (True, days_before, days_after2)
             except Exception as e:
                 self.log(f"⚠️ 刷新重读失败: {str(e)[:60]}")
-            # 天数确实没变 = 续期未生效，绝不误报成功
-            self.log("❌ 续期未生效：天数未增加（可能 Sponsor 未完成或续期被拒）")
+            # 天数确实没变 = 续期未生效，机会已消耗，明确报失败（不重复点击）
+            self.log("❌ 续期未生效：天数未增加（Sponsor 已走完但续期未生效）")
             return (False, days_before, days_after)
         except Exception as e:
             self.log(f"⚠️ 结果检查失败: {str(e)[:60]}")
