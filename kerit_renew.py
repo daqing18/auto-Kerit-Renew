@@ -361,12 +361,167 @@ class KeritCloudRenewal:
             self.log(f"⚠️ get_remaining_days 异常: {e}")
             return 0
 
+    def _find_complete_renewal(self, sb):
+        """在当前上下文（主文档或已切入的 frame）查找 Complete Renewal 按钮。
+        支持 shadow DOM 穿透。返回 dict(count/hits/best) 或 None。"""
+        try:
+            r = sb.execute_script("""
+                (function(){
+                    var allHits = [];
+                    // 收集所有包含 "complete renewal" 文本的元素（含 shadow DOM 穿透）
+                    function collectIn(root, depth) {
+                        if (depth > 4) return;
+                        var all = root.querySelectorAll('button, .btn, [role="button"], a, span, div, input');
+                        for (var i = 0; i < all.length; i++) {
+                            var t = (all[i].textContent || '').trim().toLowerCase();
+                            if (t.indexOf('complete renewal') !== -1) {
+                                allHits.push({
+                                    tag: all[i].tagName,
+                                    id: all[i].id || '',
+                                    cls: (all[i].className || '').toString().slice(0,60),
+                                    disabled: !!all[i].disabled,
+                                    visible: all[i].getClientRects().length > 0,
+                                    offParent: all[i].offsetParent !== null,
+                                    text: (all[i].textContent || '').trim().slice(0,60)
+                                });
+                            }
+                            // 穿透 shadow DOM
+                            if (all[i].shadowRoot) {
+                                collectIn(all[i].shadowRoot, depth + 1);
+                            }
+                        }
+                        // 页面级 shadow host
+                        var hosts = root.querySelectorAll('*');
+                        for (var i = 0; i < hosts.length; i++) {
+                            if (hosts[i].shadowRoot) {
+                                collectIn(hosts[i].shadowRoot, depth + 1);
+                            }
+                        }
+                    }
+                    collectIn(document, 0);
+                    // 优先：可见且非 disabled 的元素（取最深 = cls 最长的）
+                    var best = null;
+                    for (var i = 0; i < allHits.length; i++) {
+                        var h = allHits[i];
+                        if (h.visible && !h.disabled) {
+                            if (!best || h.cls.length >= best.cls.length) best = h;
+                        }
+                    }
+                    return { count: allHits.length, hits: allHits.slice(0,8), best: best };
+                })()
+            """)
+            return r
+        except Exception as e:
+            self.log(f"   ⚠️ 检测异常: {str(e)[:60]}")
+            return None
+
+    def _locate_complete_renewal(self, sb):
+        """主文档 + 遍历所有 iframe（WebDriver frame 切换，跨域可用）定位按钮。
+        返回 (frame_index 或 None=主文档, 检测dict) 或 (None, None)。
+        注意：无论在哪找到，返回前都切回主文档，避免后续点击/取URL 在 frame 里出问题。"""
+        r = self._find_complete_renewal(sb)
+        if r and r.get('count', 0) > 0:
+            return (None, r)
+        try:
+            from selenium.webdriver.common.by import By
+            iframes = sb.driver.find_elements(By.TAG_NAME, "iframe")
+            self.log(f"   🧩 主文档未找到，检查 {len(iframes)} 个 iframe...")
+            for idx in range(len(iframes)):
+                try:
+                    sb.driver.switch_to.frame(idx)
+                    r = self._find_complete_renewal(sb)
+                    if r and r.get('count', 0) > 0:
+                        self.log(f"   🧩 在 iframe[{idx}] 找到 Complete Renewal")
+                        try:
+                            sb.driver.switch_to.default_content()
+                        except Exception:
+                            pass
+                        return (idx, r)
+                except Exception as e:
+                    self.log(f"   ⚠️ iframe[{idx}] 检测失败: {str(e)[:50]}")
+                finally:
+                    try:
+                        sb.driver.switch_to.default_content()
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.log(f"   ⚠️ iframe 枚举失败: {str(e)[:50]}")
+        return (None, None)
+
+    def _click_complete_renewal(self, sb, frame_idx):
+        """在指定上下文点击 Complete Renewal。frame_idx=None 表示主文档。"""
+        try:
+            if frame_idx is not None:
+                sb.driver.switch_to.frame(frame_idx)
+            result = sb.execute_script("""
+                (function(){
+                    var all = document.querySelectorAll('button, .btn, [role="button"], a, span, div');
+                    for (var i = 0; i < all.length; i++) {
+                        var t = (all[i].textContent || '').trim().toLowerCase();
+                        if (t.indexOf('complete renewal') !== -1
+                            && all[i].getClientRects().length > 0) {
+                            all[i].click();
+                            return 'clicked';
+                        }
+                    }
+                    return 'not-found';
+                })()
+            """)
+            if frame_idx is not None:
+                sb.driver.switch_to.default_content()
+            return result
+        except Exception as e:
+            self.log(f"   ⚠️ 点击异常: {str(e)[:60]}")
+            if frame_idx is not None:
+                try:
+                    sb.driver.switch_to.default_content()
+                except Exception:
+                    pass
+            return 'error'
+
+    def _send_check6_debug(self, sb, days_before):
+        """检查⑥失败时：截图 + 页面现场信息发 TG，便于定位按钮到底在哪"""
+        try:
+            shot = f"{self.screenshot_dir}/check6_fail.png"
+            try:
+                sb.save_screenshot(shot)
+            except Exception:
+                shot = None
+            diag = None
+            try:
+                diag = sb.execute_script("""
+                    (function(){
+                        var out = {url: location.href, iframes: document.querySelectorAll('iframe').length};
+                        var texts = [];
+                        var all = document.querySelectorAll('body *');
+                        for (var i = 0; i < all.length && texts.length < 25; i++) {
+                            var el = all[i];
+                            if (el.getClientRects().length === 0) continue;
+                            var t = (el.textContent||'').trim();
+                            if (t.length > 1 && t.length < 60 && el.children.length === 0) texts.push(t);
+                        }
+                        out.texts = texts;
+                        return out;
+                    })()
+                """)
+            except Exception as e:
+                self.log(f"   🔬 现场分析失败: {str(e)[:60]}")
+            msg = (f"⚠️ Kerit 检查⑥失败（未找到 Complete Renewal）\n"
+                   f"URL: {(diag or {}).get('url','?')}\n"
+                   f"iframe数: {(diag or {}).get('iframes','?')}\n"
+                   f"剩余天数: {days_before}")
+            if diag and diag.get('texts'):
+                msg += "\n可见文本: " + " | ".join(diag['texts'][:15])
+            self.send_telegram_notify(msg, shot)
+        except Exception as e:
+            self.log(f"   🔬 诊断/截图失败: {str(e)[:60]}")
+
     def click_sponsor_and_complete_renew(self, sb):
         """点击 Sponsor 并完成续期
         流程（完全模拟手动操作，单次线性，任一检查不过立即终止本次续期）：
           读天数 → 点 Sponsor → 浏览器健康检查 → 等 Sponsor 页加载完成
-          → 关闭 Sponsor 页 → 验证回落续期页 → 等 renewBtn 激活
-          → 最终三重检查 → 点一次 Complete Renewal → 验证天数
+          → 关闭 Sponsor 页 → 验证回落续期页 → 定位 Complete Renewal（主文档+iframe）
+          → 点击前确认 → 点一次 Complete Renewal → 验证天数
         注意：所有检查只执行一次，任何一项没过就【关闭本次续期】返回失败，
               绝不重试、绝不继续，因为机会只有一次，状态不对重试只会浪费。
         返回: (success: bool, days_before: int, days_after: int)
@@ -496,177 +651,48 @@ class KeritCloudRenewal:
             return (False, days_before, -1)
         self.log("✅ 检查⑤通过：当前在续期页")
 
-        # ===== 检查⑥：等 Complete Renewal 激活（Sponsor 完成 + Turnstile token 异步生成）=====
-        # 改进：主文档 + 遍历所有 iframe 检测按钮（按钮可能在弹窗 iframe 里，主文档查不到）
-        self.log("⏳ 检查⑥：等待 Complete Renewal 激活...")
-        btn_ready = False
+        # ===== 检查⑥：定位 Complete Renewal（主文档 + WebDriver frame 切换，跨域 iframe 也能进）=====
+        # 关键：不用 JS contentDocument（跨域会抛 SecurityError 被吞），改用 switch_to.frame 协议层穿透
+        self.log("⏳ 检查⑥：定位 Complete Renewal 按钮...")
+        btn_loc = None       # None=主文档, int=iframe 索引
+        btn_info = None
         for attempt in range(5):  # 5次 × 1.5s ≈ 8s（检测到立即 break）
-            try:
-                result = sb.execute_script("""
-                    (function(){
-                        // 在指定 doc 内查找激活的 Complete Renewal 按钮
-                        function findActive(doc) {
-                            var btn = doc.getElementById('renewBtn');
-                            if (btn && !btn.disabled) return 'id';
-                            var all = doc.querySelectorAll('button, .btn, [role="button"], a');
-                            for (var i = 0; i < all.length; i++) {
-                                var t = (all[i].textContent || '').trim();
-                                if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                                    && !all[i].disabled && all[i].getClientRects().length > 0) {
-                                    return 'text';
-                                }
-                            }
-                            return null;
-                        }
-                        // 主文档
-                        var r = findActive(document);
-                        if (r) return r;
-                        // 遍历 iframe
-                        var frames = document.querySelectorAll('iframe');
-                        for (var i = 0; i < frames.length; i++) {
-                            try {
-                                var fdoc = frames[i].contentDocument;
-                                if (fdoc) {
-                                    r = findActive(fdoc);
-                                    if (r) return r;
-                                }
-                            } catch (e) {}
-                        }
-                        return null;
-                    })()
-                """)
-                if result:
-                    btn_ready = True
-                    self.log(f"   ✅ 检查⑥通过：Complete Renewal 已激活（方式={result}，尝试 {attempt+1}/5）")
-                    break
-                self.log(f"   🔍 [{attempt+1}/5] 按钮未激活，继续等待...")
-            except Exception as e:
-                self.log(f"   ⚠️ 检查按钮状态失败: {str(e)[:60]}")
+            frame_idx, info = self._locate_complete_renewal(sb)
+            if info and info.get('count', 0) > 0:
+                btn_loc = frame_idx
+                btn_info = info
+                where = "主文档" if frame_idx is None else f"iframe[{frame_idx}]"
+                self.log(f"   ✅ 检查⑥通过：找到 Complete Renewal（{where}，尝试 {attempt+1}/5）")
+                break
+            self.log(f"   🔍 [{attempt+1}/5] 未找到按钮，继续等待...")
             time.sleep(1.5)
-        if not btn_ready:
-            self.log("❌ 检查⑥失败（Complete Renewal 未激活），关闭本次续期")
-            # 失败诊断：dump 页面结构，定位按钮到底在哪
-            try:
-                diag = sb.execute_script("""
-                    (function(){
-                        var out = {};
-                        out.url = location.href;
-                        out.iframeCount = document.querySelectorAll('iframe').length;
-                        var btns = [];
-                        var all = document.querySelectorAll('button, .btn, [role="button"], a, [onclick], [class*="btn"], [class*="button"]');
-                        for (var i = 0; i < all.length && i < 60; i++) {
-                            var t = (all[i].textContent || '').trim().slice(0, 40);
-                            if (!t) t = '(no-text)';
-                            var rc = all[i].getClientRects().length;
-                            var op = all[i].offsetParent !== null ? 'op:yes' : 'op:null';
-                            var vis = rc > 0 ? 'visible' : 'hidden';
-                            if (t.indexOf('Renewal') !== -1 || t.indexOf('Sponsor') !== -1 || t.indexOf('Complete') !== -1 || rc > 0) {
-                                btns.push(t + ' | ' + vis + ' ' + op + ' disabled=' + (all[i].disabled ? 'T' : 'F') + ' tag=' + all[i].tagName);
-                            }
-                        }
-                        out.buttons = btns;
-                        // 检查 shadow DOM
-                        var sd = [];
-                        var walker = document.querySelectorAll('*');
-                        for (var i = 0; i < walker.length; i++) {
-                            if (walker[i].shadowRoot) sd.push(walker[i].tagName + '.' + (walker[i].className || '').toString().slice(0,30));
-                        }
-                        out.shadowRoots = sd.slice(0, 10);
-                        return out;
-                    })()
-                """)
-                if isinstance(diag, dict):
-                    self.log(f"   🔬 诊断 URL: {diag.get('url', '?')}")
-                    self.log(f"   🔬 诊断 iframe 数量: {diag.get('iframeCount', '?')}")
-                    for b in (diag.get('buttons') or [])[:20]:
-                        self.log(f"   🔬 按钮候选: {b}")
-                    if diag.get('shadowRoots'):
-                        self.log(f"   🔬 shadowRoot: {diag.get('shadowRoots')}")
-            except Exception as e:
-                self.log(f"   🔬 诊断失败: {str(e)[:60]}")
+        if btn_loc is None:
+            self.log("❌ 检查⑥失败（未找到 Complete Renewal 按钮），关闭本次续期")
+            self._send_check6_debug(sb, days_before)
             return (False, days_before, -1)
 
-        # ===== 检查⑦：点击前最终检查（机会未消耗，全部通过才点击）=====
-        #   ① 当前在续期页(billing.kerit.cloud)
-        #   ② 按钮已激活（主文档 + iframe）
+        # ===== 检查⑦：点击前确认仍在续期页（机会未消耗，URL 不符立即终止）=====
         try:
             final_url = sb.driver.current_url
-            btn_ready = sb.execute_script("""
-                (function(){
-                    function findActive(doc) {
-                        var btn = doc.getElementById('renewBtn');
-                        if (btn && !btn.disabled) return true;
-                        var all = doc.querySelectorAll('button, .btn, [role="button"], a');
-                        for (var i = 0; i < all.length; i++) {
-                            var t = (all[i].textContent || '').trim();
-                            if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                                && !all[i].disabled && all[i].getClientRects().length > 0) {
-                                return true;
-                            }
-                        }
-                        return false;
-                    }
-                    if (findActive(document)) return true;
-                    var frames = document.querySelectorAll('iframe');
-                    for (var i = 0; i < frames.length; i++) {
-                        try {
-                            var fdoc = frames[i].contentDocument;
-                            if (fdoc && findActive(fdoc)) return true;
-                        } catch (e) {}
-                    }
-                    return false;
-                })()
-            """)
             url_ok = "billing.kerit.cloud" in (final_url or "")
-            self.log(f"🔎 检查⑦：URL={'OK' if url_ok else 'FAIL'} | 按钮激活={'OK' if btn_ready else 'FAIL'}")
-            if not (url_ok and btn_ready):
-                self.log(f"❌ 检查⑦失败（最终检查未通过，URL={final_url}），关闭本次续期")
+            self.log(f"🔎 检查⑦：URL={'OK' if url_ok else 'FAIL'} | 按钮位置={'主文档' if btn_loc is None else f'iframe[{btn_loc}]'}")
+            if not url_ok:
+                self.log(f"❌ 检查⑦失败（不在续期页: {final_url}），关闭本次续期")
                 return (False, days_before, -1)
         except Exception as e:
             self.log(f"❌ 检查⑦异常: {str(e)[:60]}，关闭本次续期")
             return (False, days_before, -1)
         self.log("✅ 检查⑦通过：全部就绪，开始点击 Complete Renewal")
 
-        # ===== 点击 Complete Renewal（只点一次，绝不重复；主文档 + iframe）=====
+        # ===== 点击 Complete Renewal（只点一次，绝不重复；按定位到的 frame 切换点击）=====
         try:
             self.log("🖱️ 点击 Complete Renewal...")
-            clicked = sb.execute_script("""
-                (function(){
-                    // 在主文档点击
-                    function clickIn(doc) {
-                        var btn = doc.getElementById('renewBtn');
-                        if (btn && !btn.disabled) { btn.click(); return 'id'; }
-                        var all = doc.querySelectorAll('button, .btn, [role="button"], a');
-                        for (var i = 0; i < all.length; i++) {
-                            var t = (all[i].textContent || '').trim();
-                            if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                                && !all[i].disabled && all[i].getClientRects().length > 0) {
-                                all[i].click();
-                                return 'text';
-                            }
-                        }
-                        return null;
-                    }
-                    var r = clickIn(document);
-                    if (r) return 'main:' + r;
-                    // 遍历 iframe 点击
-                    var frames = document.querySelectorAll('iframe');
-                    for (var i = 0; i < frames.length; i++) {
-                        try {
-                            var fdoc = frames[i].contentDocument;
-                            if (fdoc) {
-                                r = clickIn(fdoc);
-                                if (r) return 'iframe' + i + ':' + r;
-                            }
-                        } catch (e) {}
-                    }
-                    return 'not-found';
-                })()
-            """)
-            if clicked != 'not-found':
-                self.log(f"✅ 已点击 Complete Renewal (方式: {clicked})")
+            clicked = self._click_complete_renewal(sb, btn_loc)
+            if clicked == 'clicked':
+                where = "主文档" if btn_loc is None else f"iframe[{btn_loc}]"
+                self.log(f"✅ 已点击 Complete Renewal（{where}）")
             else:
-                self.log("⚠️ 未找到 Complete Renewal 按钮")
+                self.log(f"⚠️ 未找到 Complete Renewal 按钮（结果: {clicked}）")
                 return (False, days_before, -1)
         except Exception as e:
             self.log(f"⚠️ JS 点击失败: {str(e)[:60]}，尝试 ENTER")
