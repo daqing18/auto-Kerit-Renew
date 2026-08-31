@@ -455,7 +455,7 @@ class KeritCloudRenewal:
             return (False, days_before, -1)
         self.log("✅ 检查③通过：Sponsor 页面已加载完成")
 
-        # ===== 检查④：关闭 Sponsor 新窗口，并验证回落到续期页 =====
+        # ===== 检查④：关闭 Sponsor 新窗口（非弹窗），并验证回落到续期页 =====
         self.log("🔎 检查④：关闭 Sponsor 窗口并验证回落...")
         back_ok = False
         try:
@@ -496,15 +496,28 @@ class KeritCloudRenewal:
             return (False, days_before, -1)
         self.log("✅ 检查⑤通过：当前在续期页")
 
-        # ===== 检查⑥：等 renewBtn 激活（Sponsor 完成 + Turnstile token 异步生成，最多 ~20s）=====
+        # ===== 检查⑥：等 Complete Renewal 激活（Sponsor 完成 + Turnstile token 异步生成）=====
+        # 改进：不只用 id='renewBtn'，也用文本匹配兜底（按钮可能在弹窗里，id 不一定对）
         self.log("⏳ 检查⑥：等待 Complete Renewal 激活...")
         btn_ready = False
-        for _ in range(13):
+        for _ in range(20):  # 延长到 ~30s（20次 × 1.5s）
             try:
                 ready = sb.execute_script("""
                     (function(){
+                        // 策略1：用 ID 找
                         var btn = document.getElementById('renewBtn');
-                        return btn ? !btn.disabled : false;
+                        if (btn && !btn.disabled) return true;
+                        // 策略2：用文本匹配（兜底）
+                        var all = document.querySelectorAll('button, .btn, [role="button"]');
+                        for (var i = 0; i < all.length; i++) {
+                            var t = (all[i].textContent || '').trim();
+                            if (t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1) {
+                                if (!all[i].disabled && all[i].offsetParent !== null) {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
                     })()
                 """)
                 if ready:
@@ -521,20 +534,31 @@ class KeritCloudRenewal:
 
         # ===== 检查⑦：点击前最终三重检查（机会未消耗，全部通过才点击）=====
         #   ① 当前在续期页(billing.kerit.cloud)
-        #   ② renewBtn 按钮存在
-        #   ③ renewBtn 已激活(未disabled)
+        #   ② 按钮存在（ID 或文本匹配）
+        #   ③ 按钮已激活(未disabled)
         try:
             final_url = sb.driver.current_url
             final_btn = sb.execute_script("""
                 (function(){
                     var btn = document.getElementById('renewBtn');
-                    return btn ? {exists:true, disabled:btn.disabled} : {exists:false, disabled:true};
+                    if (btn) return {exists:true, disabled:btn.disabled, id:'renewBtn'};
+                    // 文本匹配兜底
+                    var all = document.querySelectorAll('button, .btn, [role="button"]');
+                    for (var i = 0; i < all.length; i++) {
+                        var t = (all[i].textContent || '').trim();
+                        if (t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1) {
+                            if (all[i].offsetParent !== null) {
+                                return {exists:true, disabled:all[i].disabled, id:'text-match'};
+                            }
+                        }
+                    }
+                    return {exists:false, disabled:true, id:'none'};
                 })()
             """)
             url_ok = "billing.kerit.cloud" in (final_url or "")
             btn_exists = bool(final_btn and final_btn.get("exists"))
             btn_active = bool(final_btn and not final_btn.get("disabled"))
-            self.log(f"🔎 检查⑦：URL={'OK' if url_ok else 'FAIL'} | 按钮存在={'OK' if btn_exists else 'FAIL'} | 按钮激活={'OK' if btn_active else 'FAIL'}")
+            self.log(f"🔎 检查⑦：URL={'OK' if url_ok else 'FAIL'} | 按钮存在={'OK' if btn_exists else 'FAIL'} | 按钮激活={'OK' if btn_active else 'FAIL'} | 来源={final_btn.get('id','?')}")
             if not (url_ok and btn_exists and btn_active):
                 self.log(f"❌ 检查⑦失败（最终检查未通过，URL={final_url}），关闭本次续期")
                 return (False, days_before, -1)
@@ -546,8 +570,23 @@ class KeritCloudRenewal:
         # ===== 点击 Complete Renewal（只点一次，绝不重复）=====
         try:
             self.log("🖱️ 点击 Complete Renewal...")
-            sb.execute_script("document.getElementById('renewBtn').click();")
-            self.log("✅ 已点击 Complete Renewal")
+            clicked = sb.execute_script("""
+                (function(){
+                    var btn = document.getElementById('renewBtn');
+                    if (btn && !btn.disabled) { btn.click(); return 'id-renewBtn'; }
+                    var all = document.querySelectorAll('button, .btn, [role="button"]');
+                    for (var i = 0; i < all.length; i++) {
+                        var t = (all[i].textContent || '').trim();
+                        if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
+                            && !all[i].disabled && all[i].offsetParent !== null) {
+                            all[i].click();
+                            return 'text-match:' + t.substring(0,20);
+                        }
+                    }
+                    return 'not-found';
+                })()
+            """)
+            self.log(f"✅ 已点击 Complete Renewal (方式: {clicked})")
         except Exception as e:
             self.log(f"⚠️ JS 点击失败: {str(e)[:60]}，尝试 ENTER")
             try:
