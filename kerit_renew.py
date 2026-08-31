@@ -431,10 +431,15 @@ class KeritCloudRenewal:
             except Exception as e:
                 self.log(f"   ⚠️ 等待 Sponsor 加载重试: {str(e)[:50]}")
             time.sleep(2)
+            
         if not sponsor_loaded:
             self.log("❌ 检查③失败（Sponsor 页面未加载完成），关闭本次续期")
             return (False, days_before, -1)
+            
         self.log("✅ 检查③通过：Sponsor 页面已加载完成")
+
+        self.log("⏳ 模拟真实浏览，在 Sponsor 页面停留 18 秒以完成有效验证...")
+        time.sleep(18)
 
         self.log("🔎 检查④：关闭 Sponsor 窗口并验证回落...")
         back_ok = False
