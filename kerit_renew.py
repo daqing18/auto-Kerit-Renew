@@ -104,7 +104,7 @@ class KeritCloudRenewal:
         """点击 Discord 登录按钮，带多重 fallback"""
         self.log("🔍 等待 Discord 登录按钮...")
         # 先检查当前页面是否有 Discord 登录按钮
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 # 方式1: 标准选择器
                 sb.wait_for_element_visible('a[href="/auth/discord"]', timeout=15)
@@ -157,8 +157,8 @@ class KeritCloudRenewal:
         self.log("🔐 OAuth 页面分析开始")
         # 先等待 OAuth 页面加载（可能需要几秒）
         time.sleep(3)
-        for i in range(40):
-            self.log(f"🔍 分析 {i+1}/40")
+        for i in range(2):
+            self.log(f"🔍 分析 {i+1}/2")
             time.sleep(2)
             try:
                 buttons = sb.find_elements("button")
@@ -245,7 +245,7 @@ class KeritCloudRenewal:
             self.log(f"🔍 Renewal说明: {subtext}")
             if not status:
                 self.log("⚠️ Renewal状态为空，等待加载...")
-                for i in range(10):
+                for i in range(5):
                     time.sleep(1)
                     status = sb.execute_script("""
                         (function(){
@@ -410,14 +410,14 @@ class KeritCloudRenewal:
         # 策略：先尝试重连，重连后能取到窗口句柄才算健康；重连始终失败才判崩溃。
         self.log("🩺 检查②：浏览器健康检查（含 CDP 自动重连）...")
         browser_ok = False
-        for hc in range(10):  # 最多 ~30s 等待 CDP 恢复
+        for hc in range(5):  # 最多 ~15s 等待 CDP 恢复
             try:
                 handles = list(sb.driver.window_handles)
                 browser_ok = True
                 self.log(f"   ✅ 浏览器正常，当前窗口数: {len(handles)}")
                 break
             except Exception as e:
-                self.log(f"   ⚠️ 浏览器/CDP 未就绪 {hc+1}/10: {str(e)[:60]}，尝试重连 CDP...")
+                self.log(f"   ⚠️ 浏览器/CDP 未就绪 {hc+1}/5: {str(e)[:60]}，尝试重连 CDP...")
                 try:
                     # 重建 CDP 会话（浏览器进程存活时能救回，真崩了会抛异常）
                     if hasattr(sb.driver, "connect"):
@@ -433,7 +433,7 @@ class KeritCloudRenewal:
         # ===== 检查③：等 Sponsor 页面真正加载完成 =====
         self.log("⏳ 检查③：等待 Sponsor 页面加载完成...")
         sponsor_loaded = False
-        for _ in range(12):  # 最多 ~24s
+        for _ in range(3):  # 最多 ~6s
             try:
                 for h in list(sb.driver.window_handles):
                     try:
@@ -500,7 +500,7 @@ class KeritCloudRenewal:
         # 改进：主文档 + 遍历所有 iframe 检测按钮（按钮可能在弹窗 iframe 里，主文档查不到）
         self.log("⏳ 检查⑥：等待 Complete Renewal 激活...")
         btn_ready = False
-        for attempt in range(20):  # 延长到 ~30s（20次 × 1.5s）
+        for attempt in range(5):  # 5次 × 1.5s ≈ 8s（检测到立即 break）
             try:
                 result = sb.execute_script("""
                     (function(){
@@ -512,7 +512,7 @@ class KeritCloudRenewal:
                             for (var i = 0; i < all.length; i++) {
                                 var t = (all[i].textContent || '').trim();
                                 if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                                    && !all[i].disabled && all[i].offsetParent !== null) {
+                                    && !all[i].disabled && all[i].getClientRects().length > 0) {
                                     return 'text';
                                 }
                             }
@@ -537,14 +537,53 @@ class KeritCloudRenewal:
                 """)
                 if result:
                     btn_ready = True
-                    self.log(f"   ✅ 检查⑥通过：Complete Renewal 已激活（方式={result}，尝试 {attempt+1}/20）")
+                    self.log(f"   ✅ 检查⑥通过：Complete Renewal 已激活（方式={result}，尝试 {attempt+1}/5）")
                     break
-                self.log(f"   🔍 [{attempt+1}/20] 按钮未激活，继续等待...")
+                self.log(f"   🔍 [{attempt+1}/5] 按钮未激活，继续等待...")
             except Exception as e:
                 self.log(f"   ⚠️ 检查按钮状态失败: {str(e)[:60]}")
             time.sleep(1.5)
         if not btn_ready:
             self.log("❌ 检查⑥失败（Complete Renewal 未激活），关闭本次续期")
+            # 失败诊断：dump 页面结构，定位按钮到底在哪
+            try:
+                diag = sb.execute_script("""
+                    (function(){
+                        var out = {};
+                        out.url = location.href;
+                        out.iframeCount = document.querySelectorAll('iframe').length;
+                        var btns = [];
+                        var all = document.querySelectorAll('button, .btn, [role="button"], a, [onclick], [class*="btn"], [class*="button"]');
+                        for (var i = 0; i < all.length && i < 60; i++) {
+                            var t = (all[i].textContent || '').trim().slice(0, 40);
+                            if (!t) t = '(no-text)';
+                            var rc = all[i].getClientRects().length;
+                            var op = all[i].offsetParent !== null ? 'op:yes' : 'op:null';
+                            var vis = rc > 0 ? 'visible' : 'hidden';
+                            if (t.indexOf('Renewal') !== -1 || t.indexOf('Sponsor') !== -1 || t.indexOf('Complete') !== -1 || rc > 0) {
+                                btns.push(t + ' | ' + vis + ' ' + op + ' disabled=' + (all[i].disabled ? 'T' : 'F') + ' tag=' + all[i].tagName);
+                            }
+                        }
+                        out.buttons = btns;
+                        // 检查 shadow DOM
+                        var sd = [];
+                        var walker = document.querySelectorAll('*');
+                        for (var i = 0; i < walker.length; i++) {
+                            if (walker[i].shadowRoot) sd.push(walker[i].tagName + '.' + (walker[i].className || '').toString().slice(0,30));
+                        }
+                        out.shadowRoots = sd.slice(0, 10);
+                        return out;
+                    })()
+                """)
+                if isinstance(diag, dict):
+                    self.log(f"   🔬 诊断 URL: {diag.get('url', '?')}")
+                    self.log(f"   🔬 诊断 iframe 数量: {diag.get('iframeCount', '?')}")
+                    for b in (diag.get('buttons') or [])[:20]:
+                        self.log(f"   🔬 按钮候选: {b}")
+                    if diag.get('shadowRoots'):
+                        self.log(f"   🔬 shadowRoot: {diag.get('shadowRoots')}")
+            except Exception as e:
+                self.log(f"   🔬 诊断失败: {str(e)[:60]}")
             return (False, days_before, -1)
 
         # ===== 检查⑦：点击前最终检查（机会未消耗，全部通过才点击）=====
@@ -561,7 +600,7 @@ class KeritCloudRenewal:
                         for (var i = 0; i < all.length; i++) {
                             var t = (all[i].textContent || '').trim();
                             if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                                && !all[i].disabled && all[i].offsetParent !== null) {
+                                && !all[i].disabled && all[i].getClientRects().length > 0) {
                                 return true;
                             }
                         }
@@ -601,7 +640,7 @@ class KeritCloudRenewal:
                         for (var i = 0; i < all.length; i++) {
                             var t = (all[i].textContent || '').trim();
                             if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                                && !all[i].disabled && all[i].offsetParent !== null) {
+                                && !all[i].disabled && all[i].getClientRects().length > 0) {
                                 all[i].click();
                                 return 'text';
                             }
@@ -764,7 +803,7 @@ class KeritCloudRenewal:
                 self.log("✅ 点击Renew按钮")
                 self.log("🖱️ JS点击 Renew Server")
                 renew_btn_clicked = False
-                for _ in range(5):
+                for _ in range(3):
                     try:
                         # 尝试 JS 点击
                         sb.execute_script("""
@@ -782,7 +821,7 @@ class KeritCloudRenewal:
                         self.log("✅ Renew Server 按钮点击成功")
                         break
                     except Exception as e:
-                        self.log(f"⚠️ 点击失败，重试... ({_ + 1}/5)")
+                        self.log(f"⚠️ 点击失败，重试... ({_ + 1}/3)")
                         time.sleep(2)
                 if not renew_btn_clicked:
                     self.log("❌ Renew Server 按钮未找到")
