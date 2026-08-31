@@ -500,28 +500,50 @@ class KeritCloudRenewal:
         # 改进：不只用 id='renewBtn'，也用文本匹配兜底（按钮可能在弹窗里，id 不一定对）
         self.log("⏳ 检查⑥：等待 Complete Renewal 激活...")
         btn_ready = False
-        for _ in range(20):  # 延长到 ~30s（20次 × 1.5s）
+        for attempt in range(20):  # 延长到 ~30s（20次 × 1.5s）
             try:
-                ready = sb.execute_script("""
+                result = sb.execute_script("""
                     (function(){
+                        var info = {};
                         // 策略1：用 ID 找
                         var btn = document.getElementById('renewBtn');
-                        if (btn && !btn.disabled) return true;
+                        info['renewBtn'] = btn ? {exists:true, disabled:btn.disabled} : {exists:false};
                         // 策略2：用文本匹配（兜底）
                         var all = document.querySelectorAll('button, .btn, [role="button"]');
+                        info['all_buttons'] = [];
                         for (var i = 0; i < all.length; i++) {
                             var t = (all[i].textContent || '').trim();
                             if (t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1) {
-                                if (!all[i].disabled && all[i].offsetParent !== null) {
-                                    return true;
-                                }
+                                info['all_buttons'].push({
+                                    text: t.substring(0,30),
+                                    disabled: all[i].disabled,
+                                    visible: all[i].offsetParent !== null
+                                });
                             }
                         }
-                        return false;
+                        // 弹窗状态
+                        var modal = document.querySelector('.modal, [class*="modal"]');
+                        info['modal_open'] = modal ? modal.offsetParent !== null : false;
+                        return info;
                     })()
                 """)
+                # 打印调试信息
+                renew_btn = result.get('renewBtn', {})
+                buttons = result.get('all_buttons', [])
+                modal_open = result.get('modal_open', False)
+                self.log(f"   🔍 [{attempt+1}/20] renewBtn={renew_btn} | 找到'{result.get('all_buttons', [])}'按钮 {len(buttons)}个 | 弹窗开={modal_open}")
+                for b in buttons:
+                    self.log(f"      - 文本={b['text']} disabled={b['disabled']} visible={b['visible']}")
+                ready = False
+                if renew_btn.get('exists') and not renew_btn.get('disabled'):
+                    ready = True
+                for b in buttons:
+                    if not b.get('disabled') and b.get('visible'):
+                        ready = True
+                        break
                 if ready:
                     btn_ready = True
+                    self.log(f"   ✅ 检查⑥通过：Complete Renewal 已激活")
                     break
             except Exception as e:
                 self.log(f"   ⚠️ 检查按钮状态失败: {str(e)[:60]}")
@@ -530,7 +552,6 @@ class KeritCloudRenewal:
         if not btn_ready:
             self.log("❌ 检查⑥失败（Complete Renewal 未激活），关闭本次续期")
             return (False, days_before, -1)
-        self.log("✅ 检查⑥通过：Complete Renewal 已激活")
 
         # ===== 检查⑦：点击前最终三重检查（机会未消耗，全部通过才点击）=====
         #   ① 当前在续期页(billing.kerit.cloud)
