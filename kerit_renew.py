@@ -404,8 +404,11 @@ class KeritCloudRenewal:
             self.log(f"❌ 检查①失败（Sponsor 点击失败）: {e}，关闭本次续期")
             return (False, days_before, -1)
 
-        # ===== 检查②：浏览器健康检查（解决点 Sponsor 后 CDP/HTTPConnectionPool 抖动）=====
-        self.log("🩺 检查②：浏览器健康检查...")
+        # ===== 检查②：浏览器健康检查（含 CDP 自动重连）=====
+        # 点 Sponsor 后 Chrome 可能因页面跳转/新窗口导致 CDP 连接断开，
+        # 但浏览器进程往往还活着，driver.connect() 可重建 CDP 会话。
+        # 策略：先尝试重连，重连后能取到窗口句柄才算健康；重连始终失败才判崩溃。
+        self.log("🩺 检查②：浏览器健康检查（含 CDP 自动重连）...")
         browser_ok = False
         for hc in range(10):  # 最多 ~30s 等待 CDP 恢复
             try:
@@ -414,10 +417,17 @@ class KeritCloudRenewal:
                 self.log(f"   ✅ 浏览器正常，当前窗口数: {len(handles)}")
                 break
             except Exception as e:
-                self.log(f"   ⚠️ 浏览器/CDP 未就绪 {hc+1}/10: {str(e)[:60]}")
-                time.sleep(3)
+                self.log(f"   ⚠️ 浏览器/CDP 未就绪 {hc+1}/10: {str(e)[:60]}，尝试重连 CDP...")
+                try:
+                    # 重建 CDP 会话（浏览器进程存活时能救回，真崩了会抛异常）
+                    if hasattr(sb.driver, "connect"):
+                        sb.driver.connect()
+                    time.sleep(2)
+                except Exception as ce:
+                    self.log(f"   ⚠️ CDP 重连失败: {str(ce)[:60]}")
+                    time.sleep(3)
         if not browser_ok:
-            self.log("❌ 检查②失败（浏览器连接异常/疑似崩溃），关闭本次续期")
+            self.log("❌ 检查②失败（浏览器连接异常/疑似崩溃，CDP 重连无效），关闭本次续期")
             return (False, days_before, -1)
 
         # ===== 检查③：等 Sponsor 页面真正加载完成 =====
