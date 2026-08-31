@@ -254,70 +254,38 @@ class KeritCloudRenewal:
 
     def get_remaining_days(self, sb) -> int:
         try:
-            page_text = sb.get_page_source()
-            days = sb.execute_script("""
-                (function(){
-                    let all = document.querySelectorAll('*');
-                    let best = null;
-                    for (let el of all) {
-                        let t = (el.innerText || el.textContent || '').trim();
-                        if (!t || t.length > 30) continue;
-                        let m = t.match(/^\\s*(\\d{1,2})\\s*days?\\s*$/i);
-                        if (m) {
-                            let v = parseInt(m[1]);
-                            if (v >= 0 && v <= 7) {
-                                if (!best || t.length < best.len) best = { v: v, len: t.length, text: t };
-                            }
-                        }
-                    }
-                    if (best) return best.v;
-                    let best2 = null;
-                    for (let el of all) {
-                        let t = (el.textContent || '').toUpperCase();
-                        if (t.includes('DAYS LEFT') && t.length < 300) {
-                            if (!best2 || t.length < best2.len) best2 = { el, len: t.length };
-                        }
-                    }
-                    if (best2) {
-                        let node = best2.el;
-                        for (let i = 0; i < 4; i++) {
-                            let text = (node.innerText || node.textContent || '').replace(/\\s+/g, ' ');
-                            let m = text.match(/DAYS\\s*LEFT[^\\d]{0,15}(\\d{1,2})/i);
-                            if (m) { let v = parseInt(m[1]); if (v >= 0 && v <= 7) return v; }
-                            node = node.parentElement;
-                            if (!node || node === document.body) break;
-                        }
-                    }
-                    return -1;
-                })()
-            """)
-            if days and 0 <= days <= 7:
-                self.log(f"📅 [JS] DAYS LEFT 卡片检测到: {days} 天")
-                return days
+            # 仅提取页面的纯视觉文本，彻底排除 HTML 标签（如 class="mb-1"）里的数字干扰
+            page_text = sb.execute_script("return document.body.innerText || '';")
+            
+            # 模式 1: 严格匹配 "X Days Left" 
+            m1 = re.search(r'\b(\d)\s*Days?\s*Left\b', page_text, re.IGNORECASE)
+            if m1 and 0 <= int(m1.group(1)) <= 7:
+                self.log(f"📅 [解析] 严格文本匹配到: {m1.group(1)}")
+                return int(m1.group(1))
 
-            m = re.search(r'\b(\d{1,2})\s*/\s*7\b', page_text)
-            if m:
+            # 模式 2: "Days Left" 在前，数字在后的换行布局
+            m2 = re.search(r'Days?\s*Left\s*[\r\n]+\s*(\d)\b', page_text, re.IGNORECASE)
+            if m2 and 0 <= int(m2.group(1)) <= 7:
+                self.log(f"📅 [解析] 换行文本匹配到: {m2.group(1)}")
+                return int(m2.group(1))
+
+            # 模式 3: 进度条格式 "X / 7"
+            m3 = re.search(r'\b(\d)\s*/\s*7\b', page_text)
+            if m3 and 0 <= int(m3.group(1)) <= 7:
+                self.log(f"📅 [解析] N/7 格式匹配到: {m3.group(1)}")
+                return int(m3.group(1))
+
+            # 模式 4: 宽松匹配 "X Days"，但排除含有 limit/max 的静态说明文字
+            matches = re.finditer(r'\b(\d)\s*Days?\b', page_text, re.IGNORECASE)
+            for m in matches:
                 val = int(m.group(1))
                 if 0 <= val <= 7:
-                    self.log(f"📅 [regex] N/7 格式匹配到: {val}")
-                    return val
+                    context = page_text[max(0, m.start()-20) : min(len(page_text), m.end()+20)].lower()
+                    if "limit" not in context and "max" not in context:
+                        self.log(f"📅 [解析] 宽松文本匹配到: {val}")
+                        return val
 
-            m = re.search(r'\b([0-6])\s*Days?\b.*?(?:7\s*day|limit|max)', page_text, re.IGNORECASE)
-            if m:
-                val = int(m.group(1))
-                self.log(f"📅 [regex] Days+limit 匹配到: {val}")
-                return val
-
-            idx = page_text.upper().find('DAYS LEFT')
-            if idx != -1:
-                chunk = page_text[idx:idx+300]
-                m = re.search(r'\b([0-7])\b', chunk)
-                if m:
-                    val = int(m.group(1))
-                    self.log(f"📅 [regex] DAYS LEFT 附近匹配到: {val}")
-                    return val
-
-            self.log("⚠️ [get_remaining_days] 未匹配到有效天数，返回 0")
+            self.log("⚠️ 未能在纯文本中识别有效天数，默认回退返回 0")
             return 0
         except Exception as e:
             self.log(f"⚠️ get_remaining_days 异常: {e}")
@@ -361,7 +329,7 @@ class KeritCloudRenewal:
 
     def click_sponsor_and_complete_renew(self, sb):
         days_before = self.get_remaining_days(sb)
-        self.log(f"📅 续期前剩余天数: {days_before}（来源：DAYS LEFT 卡片，非 tooltip）")
+        self.log(f"📅 续期前剩余天数: {days_before}")
         if days_before >= 7:
             self.log("⚠️ 已达最大天数(7天)，无需续期")
             return (False, days_before, days_before)
