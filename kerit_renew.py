@@ -497,29 +497,47 @@ class KeritCloudRenewal:
         self.log("✅ 检查⑤通过：当前在续期页")
 
         # ===== 检查⑥：等 Complete Renewal 激活（Sponsor 完成 + Turnstile token 异步生成）=====
-        # 改进：不只用 id='renewBtn'，也用文本匹配兜底（按钮可能在弹窗里，id 不一定对）
+        # 改进：主文档 + 遍历所有 iframe 检测按钮（按钮可能在弹窗 iframe 里，主文档查不到）
         self.log("⏳ 检查⑥：等待 Complete Renewal 激活...")
         btn_ready = False
         for attempt in range(20):  # 延长到 ~30s（20次 × 1.5s）
             try:
                 result = sb.execute_script("""
                     (function(){
-                        var btn = document.getElementById('renewBtn');
-                        if (btn && !btn.disabled) return true;
-                        var all = document.querySelectorAll('button, .btn, [role="button"]');
-                        for (var i = 0; i < all.length; i++) {
-                            var t = (all[i].textContent || '').trim();
-                            if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                                && !all[i].disabled && all[i].offsetParent !== null) {
-                                return true;
+                        // 在指定 doc 内查找激活的 Complete Renewal 按钮
+                        function findActive(doc) {
+                            var btn = doc.getElementById('renewBtn');
+                            if (btn && !btn.disabled) return 'id';
+                            var all = doc.querySelectorAll('button, .btn, [role="button"], a');
+                            for (var i = 0; i < all.length; i++) {
+                                var t = (all[i].textContent || '').trim();
+                                if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
+                                    && !all[i].disabled && all[i].offsetParent !== null) {
+                                    return 'text';
+                                }
                             }
+                            return null;
                         }
-                        return false;
+                        // 主文档
+                        var r = findActive(document);
+                        if (r) return r;
+                        // 遍历 iframe
+                        var frames = document.querySelectorAll('iframe');
+                        for (var i = 0; i < frames.length; i++) {
+                            try {
+                                var fdoc = frames[i].contentDocument;
+                                if (fdoc) {
+                                    r = findActive(fdoc);
+                                    if (r) return r;
+                                }
+                            } catch (e) {}
+                        }
+                        return null;
                     })()
                 """)
-                if result is True:
+                if result:
                     btn_ready = True
-                    self.log(f"   ✅ 检查⑥通过：Complete Renewal 已激活（尝试 {attempt+1}/20）")
+                    self.log(f"   ✅ 检查⑥通过：Complete Renewal 已激活（方式={result}，尝试 {attempt+1}/20）")
                     break
                 self.log(f"   🔍 [{attempt+1}/20] 按钮未激活，继续等待...")
             except Exception as e:
@@ -529,22 +547,33 @@ class KeritCloudRenewal:
             self.log("❌ 检查⑥失败（Complete Renewal 未激活），关闭本次续期")
             return (False, days_before, -1)
 
-        # ===== 检查⑦：点击前最终三重检查（机会未消耗，全部通过才点击）=====
+        # ===== 检查⑦：点击前最终检查（机会未消耗，全部通过才点击）=====
         #   ① 当前在续期页(billing.kerit.cloud)
-        #   ② 按钮已激活
+        #   ② 按钮已激活（主文档 + iframe）
         try:
             final_url = sb.driver.current_url
             btn_ready = sb.execute_script("""
                 (function(){
-                    var btn = document.getElementById('renewBtn');
-                    if (btn && !btn.disabled) return true;
-                    var all = document.querySelectorAll('button, .btn, [role="button"]');
-                    for (var i = 0; i < all.length; i++) {
-                        var t = (all[i].textContent || '').trim();
-                        if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                            && !all[i].disabled && all[i].offsetParent !== null) {
-                            return true;
+                    function findActive(doc) {
+                        var btn = doc.getElementById('renewBtn');
+                        if (btn && !btn.disabled) return true;
+                        var all = doc.querySelectorAll('button, .btn, [role="button"], a');
+                        for (var i = 0; i < all.length; i++) {
+                            var t = (all[i].textContent || '').trim();
+                            if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
+                                && !all[i].disabled && all[i].offsetParent !== null) {
+                                return true;
+                            }
                         }
+                        return false;
+                    }
+                    if (findActive(document)) return true;
+                    var frames = document.querySelectorAll('iframe');
+                    for (var i = 0; i < frames.length; i++) {
+                        try {
+                            var fdoc = frames[i].contentDocument;
+                            if (fdoc && findActive(fdoc)) return true;
+                        } catch (e) {}
                     }
                     return false;
                 })()
@@ -559,21 +588,38 @@ class KeritCloudRenewal:
             return (False, days_before, -1)
         self.log("✅ 检查⑦通过：全部就绪，开始点击 Complete Renewal")
 
-        # ===== 点击 Complete Renewal（只点一次，绝不重复）=====
+        # ===== 点击 Complete Renewal（只点一次，绝不重复；主文档 + iframe）=====
         try:
             self.log("🖱️ 点击 Complete Renewal...")
             clicked = sb.execute_script("""
                 (function(){
-                    var btn = document.getElementById('renewBtn');
-                    if (btn && !btn.disabled) { btn.click(); return 'id-renewBtn'; }
-                    var all = document.querySelectorAll('button, .btn, [role="button"]');
-                    for (var i = 0; i < all.length; i++) {
-                        var t = (all[i].textContent || '').trim();
-                        if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
-                            && !all[i].disabled && all[i].offsetParent !== null) {
-                            all[i].click();
-                            return 'text-match';
+                    // 在主文档点击
+                    function clickIn(doc) {
+                        var btn = doc.getElementById('renewBtn');
+                        if (btn && !btn.disabled) { btn.click(); return 'id'; }
+                        var all = doc.querySelectorAll('button, .btn, [role="button"], a');
+                        for (var i = 0; i < all.length; i++) {
+                            var t = (all[i].textContent || '').trim();
+                            if ((t.indexOf('Complete Renewal') !== -1 || t.indexOf('complete renewal') !== -1)
+                                && !all[i].disabled && all[i].offsetParent !== null) {
+                                all[i].click();
+                                return 'text';
+                            }
                         }
+                        return null;
+                    }
+                    var r = clickIn(document);
+                    if (r) return 'main:' + r;
+                    // 遍历 iframe 点击
+                    var frames = document.querySelectorAll('iframe');
+                    for (var i = 0; i < frames.length; i++) {
+                        try {
+                            var fdoc = frames[i].contentDocument;
+                            if (fdoc) {
+                                r = clickIn(fdoc);
+                                if (r) return 'iframe' + i + ':' + r;
+                            }
+                        } catch (e) {}
                     }
                     return 'not-found';
                 })()
