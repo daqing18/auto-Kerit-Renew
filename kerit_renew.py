@@ -410,6 +410,29 @@ class KeritCloudRenewal:
 
         time.sleep(3)
         
+        # ================= 恢复：浏览器健康检查与断线重连 =================
+        self.log("🩺 检查浏览器存活状态（防止点击新窗口后失联）...")
+        browser_ok = False
+        for hc in range(5):
+            try:
+                handles = list(sb.driver.window_handles)
+                browser_ok = True
+                self.log(f"   ✅ 浏览器正常，当前窗口数: {len(handles)}")
+                break
+            except Exception as e:
+                self.log(f"   ⚠️ 浏览器未就绪，尝试重连 CDP...")
+                try:
+                    if hasattr(sb.driver, "connect"):
+                        sb.driver.connect()
+                    time.sleep(2)
+                except Exception:
+                    time.sleep(3)
+                    
+        if not browser_ok:
+            self.log("❌ 浏览器连接异常且无法重连，关闭本次续期")
+            return (False, days_before, -1)
+        # ==================================================================
+
         # 3. 处理窗口：千万不要关闭新窗口，直接切回主页面等待验证
         handles = sb.driver.window_handles
         self.log(f"🔎 当前窗口数量: {len(handles)}")
